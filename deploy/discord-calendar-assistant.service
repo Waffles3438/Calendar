@@ -1,0 +1,42 @@
+[Unit]
+Description=Discord Calendar Assistant
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=calendar
+Group=calendar
+WorkingDirectory=/srv/discord-calendar-assistant
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/discord-calendar-assistant/calendar.env
+ExecStart=/usr/bin/node dist/index.js
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+# SQLite state must survive restarts and remain writable despite ProtectSystem.
+StateDirectory=discord-calendar-assistant
+ReadWritePaths=/var/lib/discord-calendar-assistant
+
+# The bot needs outbound network access to Discord, Google, and optional Gemini.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

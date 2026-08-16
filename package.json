@@ -1,0 +1,36 @@
+{
+  "name": "discord-calendar-assistant",
+  "version": "0.1.0",
+  "description": "A personal Discord DM assistant for Google Calendar.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.15.0 <23"
+  },
+  "packageManager": "npm@11.11.0",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "check": "tsc --project tsconfig.json --noEmit",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@google/genai": "2.17.1",
+    "better-sqlite3": "13.0.3",
+    "discord.js": "14.27.0",
+    "googleapis": "174.0.1",
+    "luxon": "3.7.2",
+    "pino": "10.3.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/luxon": "3.7.4",
+    "@types/node": "22.15.0",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
