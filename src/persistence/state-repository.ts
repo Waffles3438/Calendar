@@ -3,6 +3,12 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import { MAX_REMINDER_MINUTES } from "../reminders/reminder-limits.js";
+import {
+  type CreateLocalTaskInput,
+  type LocalTask,
+  type LocalTaskTransitionInput,
+} from "../tasks/task-domain.js";
+import { isValidTaskTimeZone } from "../tasks/task-time.js";
 import { SqliteStore } from "./database.js";
 import { SecretBox } from "./secret-box.js";
 
@@ -76,6 +82,49 @@ export interface RecordReminderDeliveryInput {
   readonly scheduledFor: string;
 }
 
+export interface LocalTaskQuery {
+  readonly limit?: number;
+  readonly ownerId: string;
+}
+
+export interface DueLocalTaskQuery {
+  readonly dueAtEarliest: Date;
+  readonly dueAtLatest: Date;
+  readonly ownerId: string;
+}
+
+export interface GetLocalTaskInput {
+  readonly id: string;
+  readonly ownerId: string;
+}
+
+export interface LocalTaskReminderDeliveryInput {
+  readonly scheduledFor: Date;
+  readonly taskId: string;
+}
+
+export interface LocalTaskReminderClaimInput {
+  readonly claimToken: string;
+  readonly leaseExpiresAt: Date;
+  readonly now: Date;
+  readonly ownerId: string;
+  readonly scheduledFor: Date;
+  readonly taskId: string;
+}
+
+export interface CompleteLocalTaskReminderDeliveryInput {
+  readonly claimToken: string;
+  readonly scheduledFor: Date;
+  readonly sentAt: Date;
+  readonly taskId: string;
+}
+
+export interface ReleaseLocalTaskReminderClaimInput {
+  readonly claimToken: string;
+  readonly scheduledFor: Date;
+  readonly taskId: string;
+}
+
 export interface AuditRecordInput {
   readonly actionType: string;
   readonly actorId: string;
@@ -97,9 +146,29 @@ interface OAuthStateRow {
   readonly owner_id: string;
 }
 
+interface LocalTaskRow {
+  readonly cancelled_at: string | null;
+  readonly completed_at: string | null;
+  readonly created_at: string;
+  readonly due_at: string;
+  readonly encrypted_title: string;
+  readonly id: string;
+  readonly owner_id: string;
+  readonly revision: number;
+  readonly status: "active" | "cancelled" | "completed";
+  readonly time_zone: string;
+  readonly updated_at: string;
+}
+
 function assertValidDate(value: Date, name: string): void {
   if (Number.isNaN(value.valueOf())) {
     throw new Error(`${name} must be a valid Date`);
+  }
+}
+
+function assertNonEmpty(value: string, name: string): void {
+  if (!value.trim()) {
+    throw new Error(`${name} must not be empty`);
   }
 }
 
@@ -111,9 +180,20 @@ function hashOAuthState(state: string): string {
   return createHash("sha256").update(state, "utf8").digest("base64url");
 }
 
+function localTaskDate(value: string | null, name: string): Date | undefined {
+  if (value === null) {
+    return undefined;
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) {
+    throw new Error(`Stored local task ${name} is invalid`);
+  }
+  return parsed;
+}
+
 /**
- * Small, single-user persistence layer. Calendar event contents are intentionally
- * not mirrored locally; only encrypted credentials and delivery/safety metadata are kept.
+ * Small, single-owner persistence layer. Calendar event contents are intentionally
+ * not mirrored locally; local task titles are encrypted because they are stored here.
  */
 export class AppStateRepository {
   private readonly secretBox: SecretBox;
@@ -324,6 +404,271 @@ export class AppStateRepository {
     return consume();
   }
 
+  public createLocalTask(input: CreateLocalTaskInput): LocalTask {
+    assertNonEmpty(input.id, "id");
+    assertNonEmpty(input.ownerId, "ownerId");
+    const title = input.title.replace(/\s+/gu, " ").trim();
+    assertNonEmpty(title, "title");
+    assertValidDate(input.dueAt, "dueAt");
+    assertValidDate(input.now, "now");
+    if (!isValidTaskTimeZone(input.timeZone)) {
+      throw new Error("timeZone must be a valid IANA time zone");
+    }
+
+    const timestamp = input.now.toISOString();
+    this.store.connection
+      .prepare(
+        `
+          INSERT INTO local_tasks (
+            id, owner_id, encrypted_title, due_at, time_zone, status,
+            created_at, updated_at, completed_at, cancelled_at, revision
+          ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL, 1)
+        `,
+      )
+      .run(
+        input.id,
+        input.ownerId,
+        this.secretBox.encrypt(title),
+        input.dueAt.toISOString(),
+        input.timeZone,
+        timestamp,
+        timestamp,
+      );
+
+    const created = this.getLocalTask({ id: input.id, ownerId: input.ownerId });
+    if (!created) {
+      throw new Error("Created local task could not be read");
+    }
+    return created;
+  }
+
+  public getLocalTask(input: GetLocalTaskInput): LocalTask | undefined {
+    const row = this.store.connection
+      .prepare(
+        `
+          SELECT id, owner_id, encrypted_title, due_at, time_zone, status,
+                 created_at, updated_at, completed_at, cancelled_at, revision
+          FROM local_tasks
+          WHERE id = ? AND owner_id = ?
+        `,
+      )
+      .get(input.id, input.ownerId) as LocalTaskRow | undefined;
+
+    return row ? this.toLocalTask(row) : undefined;
+  }
+
+  public listActiveLocalTasks(input: LocalTaskQuery): readonly LocalTask[] {
+    assertNonEmpty(input.ownerId, "ownerId");
+    const limit = input.limit ?? 10_000;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) {
+      throw new Error("limit must be an integer between 1 and 10000");
+    }
+
+    const rows = this.store.connection
+      .prepare(
+        `
+          SELECT id, owner_id, encrypted_title, due_at, time_zone, status,
+                 created_at, updated_at, completed_at, cancelled_at, revision
+          FROM local_tasks
+          WHERE owner_id = ? AND status = 'active'
+          ORDER BY due_at ASC, id ASC
+          LIMIT ?
+        `,
+      )
+      .all(input.ownerId, limit) as LocalTaskRow[];
+
+    return rows.map((row) => this.toLocalTask(row));
+  }
+
+  public listDueLocalTasks(input: DueLocalTaskQuery): readonly LocalTask[] {
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertValidDate(input.dueAtEarliest, "dueAtEarliest");
+    assertValidDate(input.dueAtLatest, "dueAtLatest");
+    if (input.dueAtEarliest > input.dueAtLatest) {
+      throw new Error("dueAtEarliest must be before dueAtLatest");
+    }
+
+    const rows = this.store.connection
+      .prepare(
+        `
+          SELECT id, owner_id, encrypted_title, due_at, time_zone, status,
+                 created_at, updated_at, completed_at, cancelled_at, revision
+          FROM local_tasks
+          WHERE owner_id = ? AND status = 'active' AND due_at >= ? AND due_at <= ?
+          ORDER BY due_at ASC, id ASC
+        `,
+      )
+      .all(input.ownerId, input.dueAtEarliest.toISOString(), input.dueAtLatest.toISOString()) as LocalTaskRow[];
+
+    return rows.map((row) => this.toLocalTask(row));
+  }
+
+  public completeLocalTask(input: LocalTaskTransitionInput): LocalTask | undefined {
+    return this.transitionLocalTask(input, "completed");
+  }
+
+  public cancelLocalTask(input: LocalTaskTransitionInput): LocalTask | undefined {
+    return this.transitionLocalTask(input, "cancelled");
+  }
+
+  /**
+   * Acquires a short-lived, owner-bound claim before a Discord send. This is
+   * deliberately separate from delivery recording so failed sends are retryable.
+   */
+  public tryClaimLocalTaskReminderDelivery(input: LocalTaskReminderClaimInput): boolean {
+    assertNonEmpty(input.taskId, "taskId");
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertNonEmpty(input.claimToken, "claimToken");
+    assertValidDate(input.scheduledFor, "scheduledFor");
+    assertValidDate(input.now, "now");
+    assertValidDate(input.leaseExpiresAt, "leaseExpiresAt");
+    if (input.leaseExpiresAt <= input.now) {
+      throw new Error("leaseExpiresAt must be after now");
+    }
+
+    const claim = this.store.connection.transaction((): boolean => {
+      const scheduledFor = input.scheduledFor.toISOString();
+      this.store.connection
+        .prepare(
+          `
+            DELETE FROM local_task_reminder_claims
+            WHERE task_id = ? AND scheduled_for = ? AND lease_expires_at <= ?
+          `,
+        )
+        .run(input.taskId, scheduledFor, input.now.toISOString());
+
+      const activeTask = this.store.connection
+        .prepare(
+          `
+            SELECT 1 AS present FROM local_tasks
+            WHERE id = ? AND owner_id = ? AND status = 'active'
+          `,
+        )
+        .get(input.taskId, input.ownerId) as { present: number } | undefined;
+      if (!activeTask) {
+        return false;
+      }
+
+      const delivery = this.store.connection
+        .prepare(
+          `
+            SELECT 1 AS present FROM local_task_reminder_deliveries
+            WHERE task_id = ? AND scheduled_for = ?
+          `,
+        )
+        .get(input.taskId, scheduledFor) as { present: number } | undefined;
+      if (delivery) {
+        return false;
+      }
+
+      const result = this.store.connection
+        .prepare(
+          `
+            INSERT OR IGNORE INTO local_task_reminder_claims (
+              task_id, scheduled_for, claim_token, claimed_at, lease_expires_at
+            ) VALUES (?, ?, ?, ?, ?)
+          `,
+        )
+        .run(
+          input.taskId,
+          scheduledFor,
+          input.claimToken,
+          input.now.toISOString(),
+          input.leaseExpiresAt.toISOString(),
+        );
+      return result.changes === 1;
+    });
+
+    return claim();
+  }
+
+  /** Records a successful send and releases only the caller's durable claim. */
+  public completeLocalTaskReminderDelivery(input: CompleteLocalTaskReminderDeliveryInput): boolean {
+    assertNonEmpty(input.taskId, "taskId");
+    assertNonEmpty(input.claimToken, "claimToken");
+    assertValidDate(input.scheduledFor, "scheduledFor");
+    assertValidDate(input.sentAt, "sentAt");
+
+    const complete = this.store.connection.transaction((): boolean => {
+      const scheduledFor = input.scheduledFor.toISOString();
+      const claim = this.store.connection
+        .prepare(
+          `
+            SELECT 1 AS present FROM local_task_reminder_claims
+            WHERE task_id = ? AND scheduled_for = ? AND claim_token = ?
+          `,
+        )
+        .get(input.taskId, scheduledFor, input.claimToken) as { present: number } | undefined;
+      if (!claim) {
+        return false;
+      }
+
+      const recorded = this.store.connection
+        .prepare(
+          `
+            INSERT OR IGNORE INTO local_task_reminder_deliveries (task_id, scheduled_for, sent_at)
+            VALUES (?, ?, ?)
+          `,
+        )
+        .run(input.taskId, scheduledFor, input.sentAt.toISOString());
+      this.store.connection
+        .prepare(
+          `
+            DELETE FROM local_task_reminder_claims
+            WHERE task_id = ? AND scheduled_for = ? AND claim_token = ?
+          `,
+        )
+        .run(input.taskId, scheduledFor, input.claimToken);
+      return recorded.changes === 1;
+    });
+
+    return complete();
+  }
+
+  /** Releases a failed-send claim so the next scheduler run can retry it. */
+  public releaseLocalTaskReminderClaim(input: ReleaseLocalTaskReminderClaimInput): void {
+    assertNonEmpty(input.taskId, "taskId");
+    assertNonEmpty(input.claimToken, "claimToken");
+    assertValidDate(input.scheduledFor, "scheduledFor");
+    this.store.connection
+      .prepare(
+        `
+          DELETE FROM local_task_reminder_claims
+          WHERE task_id = ? AND scheduled_for = ? AND claim_token = ?
+        `,
+      )
+      .run(input.taskId, input.scheduledFor.toISOString(), input.claimToken);
+  }
+
+  /** Legacy read helper retained for callers outside the task scheduler. */
+  public hasLocalTaskReminderDelivery(input: { scheduledFor: Date; taskId: string }): boolean {
+    assertValidDate(input.scheduledFor, "scheduledFor");
+    const row = this.store.connection
+      .prepare(
+        `
+          SELECT 1 AS present
+          FROM local_task_reminder_deliveries
+          WHERE task_id = ? AND scheduled_for = ?
+        `,
+      )
+      .get(input.taskId, input.scheduledFor.toISOString()) as { present: number } | undefined;
+    return Boolean(row);
+  }
+
+  /** Legacy direct recorder retained for one-off maintenance use. */
+  public recordLocalTaskReminderDelivery(input: LocalTaskReminderDeliveryInput): boolean {
+    assertValidDate(input.scheduledFor, "scheduledFor");
+    const result = this.store.connection
+      .prepare(
+        `
+          INSERT OR IGNORE INTO local_task_reminder_deliveries (task_id, scheduled_for, sent_at)
+          VALUES (?, ?, ?)
+        `,
+      )
+      .run(input.taskId, input.scheduledFor.toISOString(), new Date().toISOString());
+    return result.changes === 1;
+  }
+
   public setReminderOverride(input: SetReminderOverrideInput): void {
     if (!Number.isInteger(input.minutesBefore) || input.minutesBefore < 0 || input.minutesBefore > MAX_REMINDER_MINUTES) {
       throw new Error(`minutesBefore must be an integer between 0 and ${MAX_REMINDER_MINUTES}`);
@@ -411,5 +756,69 @@ export class AppStateRepository {
         JSON.stringify(input.details ?? {}),
         new Date().toISOString(),
       );
+  }
+
+  private transitionLocalTask(
+    input: LocalTaskTransitionInput,
+    status: "cancelled" | "completed",
+  ): LocalTask | undefined {
+    assertNonEmpty(input.id, "id");
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertValidDate(input.now, "now");
+    if (!Number.isInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw new Error("expectedRevision must be a positive integer");
+    }
+
+    const timestamp = input.now.toISOString();
+    const result = this.store.connection
+      .prepare(
+        `
+          UPDATE local_tasks
+          SET status = ?,
+              updated_at = ?,
+              completed_at = CASE WHEN ? = 'completed' THEN ? ELSE completed_at END,
+              cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END,
+              revision = revision + 1
+          WHERE id = ? AND owner_id = ? AND status = 'active' AND revision = ?
+        `,
+      )
+      .run(status, timestamp, status, timestamp, status, timestamp, input.id, input.ownerId, input.expectedRevision);
+
+    return result.changes === 1 ? this.getLocalTask({ id: input.id, ownerId: input.ownerId }) : undefined;
+  }
+
+  private toLocalTask(row: LocalTaskRow): LocalTask {
+    const dueAt = localTaskDate(row.due_at, "due_at");
+    const createdAt = localTaskDate(row.created_at, "created_at");
+    const updatedAt = localTaskDate(row.updated_at, "updated_at");
+    if (!dueAt || !createdAt || !updatedAt || !isValidTaskTimeZone(row.time_zone)) {
+      throw new Error("Stored local task is invalid");
+    }
+
+    let title: string;
+    try {
+      title = this.secretBox.decrypt(row.encrypted_title).replace(/\s+/gu, " ").trim();
+    } catch {
+      throw new Error("Stored local task title could not be read safely");
+    }
+    if (!title) {
+      throw new Error("Stored local task title is invalid");
+    }
+
+    const completedAt = localTaskDate(row.completed_at, "completed_at");
+    const cancelledAt = localTaskDate(row.cancelled_at, "cancelled_at");
+    return {
+      ...(cancelledAt ? { cancelledAt } : {}),
+      ...(completedAt ? { completedAt } : {}),
+      createdAt,
+      dueAt,
+      id: row.id,
+      ownerId: row.owner_id,
+      revision: row.revision,
+      status: row.status,
+      timeZone: row.time_zone,
+      title,
+      updatedAt,
+    };
   }
 }

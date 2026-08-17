@@ -35,6 +35,14 @@ describe("loadConfig", () => {
     );
   });
 
+  it("rejects a complete Google Calendar configuration without the local bot runtime", () => {
+    expect(() => loadConfig({
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_REDIRECT_URI: "https://calendar.example.com/oauth/google/callback",
+    })).toThrow(/DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY are required/u);
+  });
+
   it("fails closed when the persisted bot integration is incomplete", () => {
     const partial = loadConfig({
       DISCORD_BOT_TOKEN: "token",

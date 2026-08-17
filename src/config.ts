@@ -1,4 +1,7 @@
+import { IANAZone } from "luxon";
 import { z } from "zod";
+
+import { DEFAULT_TASK_TIME_ZONE } from "./tasks/task-time.js";
 
 export const LOG_LEVELS = ["fatal", "error", "warn", "info", "debug", "trace", "silent"] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
@@ -10,6 +13,15 @@ const optionalString = z.preprocess(emptyStringToUndefined, z.string().trim().mi
 const geminiModel = z.preprocess(
   emptyStringToUndefined,
   z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/u).optional(),
+);
+const taskTimeZone = z.preprocess(
+  emptyStringToUndefined,
+  z.string()
+    .trim()
+    .min(1)
+    .max(100)
+    .refine((value) => IANAZone.isValidZone(value), "must be a valid IANA time zone")
+    .default(DEFAULT_TASK_TIME_ZONE),
 );
 
 const configSchema = z
@@ -32,6 +44,7 @@ const configSchema = z
       emptyStringToUndefined,
       z.coerce.number().int().min(15).max(300).default(60),
     ),
+    LOCAL_TASK_TIME_ZONE: taskTimeZone,
     DISCORD_BOT_TOKEN: optionalString,
     DISCORD_OWNER_ID: z.preprocess(
       emptyStringToUndefined,
@@ -62,6 +75,15 @@ const configSchema = z
         path: ["GOOGLE_CLIENT_ID"],
       });
     }
+    const localRuntimeValues = [value.DISCORD_BOT_TOKEN, value.DISCORD_OWNER_ID, value.ENCRYPTION_KEY];
+    if (googleValues.every(Boolean) && !localRuntimeValues.some(Boolean)) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY are required when Google Calendar is configured",
+        path: ["DISCORD_BOT_TOKEN"],
+      });
+    }
 
     const geminiValues = [value.GEMINI_API_KEY, value.GEMINI_MODEL];
     if (geminiValues.some(Boolean) && !geminiValues.every(Boolean)) {
@@ -75,14 +97,21 @@ const configSchema = z
 
 export type AppConfig = z.output<typeof configSchema>;
 
-export interface BotIntegrationConfig {
+export interface LocalBotConfig {
   readonly discordBotToken: string;
   readonly discordOwnerId: string;
   readonly encryptionKey: string;
+  readonly taskTimeZone: string;
+}
+
+export interface GoogleCalendarConfig {
   readonly googleClientId: string;
   readonly googleClientSecret: string;
   readonly googleRedirectUri: string;
 }
+
+/** Backwards-compatible full integration shape for callers that require both services. */
+export interface BotIntegrationConfig extends LocalBotConfig, GoogleCalendarConfig { }
 
 export interface GeminiFallbackConfig {
   readonly apiKey: string;
@@ -109,31 +138,15 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   return result.data;
 }
 
-/** Returns no integration in health-only mode, or fails closed for a partial bot setup. */
-export function getBotIntegrationConfig(config: AppConfig): BotIntegrationConfig | undefined {
-  const configuredValues = [
-    config.DISCORD_BOT_TOKEN,
-    config.DISCORD_OWNER_ID,
-    config.GOOGLE_CLIENT_ID,
-    config.GOOGLE_CLIENT_SECRET,
-    config.GOOGLE_REDIRECT_URI,
-    config.ENCRYPTION_KEY,
-  ];
-
+/** Returns no local bot runtime in health-only mode, or fails closed for a partial local setup. */
+export function getLocalBotConfig(config: AppConfig): LocalBotConfig | undefined {
+  const configuredValues = [config.DISCORD_BOT_TOKEN, config.DISCORD_OWNER_ID, config.ENCRYPTION_KEY];
   if (!configuredValues.some(Boolean)) {
     return undefined;
   }
-
-  if (
-    !config.DISCORD_BOT_TOKEN ||
-    !config.DISCORD_OWNER_ID ||
-    !config.GOOGLE_CLIENT_ID ||
-    !config.GOOGLE_CLIENT_SECRET ||
-    !config.GOOGLE_REDIRECT_URI ||
-    !config.ENCRYPTION_KEY
-  ) {
+  if (!config.DISCORD_BOT_TOKEN || !config.DISCORD_OWNER_ID || !config.ENCRYPTION_KEY) {
     throw new ConfigurationError(
-      "DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, and ENCRYPTION_KEY are all required to enable the bot",
+      "DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY are all required to enable Discord and local tasks",
     );
   }
 
@@ -141,10 +154,45 @@ export function getBotIntegrationConfig(config: AppConfig): BotIntegrationConfig
     discordBotToken: config.DISCORD_BOT_TOKEN,
     discordOwnerId: config.DISCORD_OWNER_ID,
     encryptionKey: config.ENCRYPTION_KEY,
+    taskTimeZone: config.LOCAL_TASK_TIME_ZONE,
+  };
+}
+
+/** Returns no Google integration when it is omitted, or fails closed for partial settings. */
+export function getGoogleCalendarConfig(config: AppConfig): GoogleCalendarConfig | undefined {
+  const configuredValues = [config.GOOGLE_CLIENT_ID, config.GOOGLE_CLIENT_SECRET, config.GOOGLE_REDIRECT_URI];
+  if (!configuredValues.some(Boolean)) {
+    return undefined;
+  }
+  if (!config.GOOGLE_CLIENT_ID || !config.GOOGLE_CLIENT_SECRET || !config.GOOGLE_REDIRECT_URI) {
+    throw new ConfigurationError(
+      "GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI must be configured together",
+    );
+  }
+
+  return {
     googleClientId: config.GOOGLE_CLIENT_ID,
     googleClientSecret: config.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: config.GOOGLE_REDIRECT_URI,
   };
+}
+
+/**
+ * Retains the original all-services contract for external callers while the
+ * application itself can start local tasks without Google configuration.
+ */
+export function getBotIntegrationConfig(config: AppConfig): BotIntegrationConfig | undefined {
+  const local = getLocalBotConfig(config);
+  const google = getGoogleCalendarConfig(config);
+  if (!local && !google) {
+    return undefined;
+  }
+  if (!local || !google) {
+    throw new ConfigurationError(
+      "DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI are all required for the full Google Calendar integration",
+    );
+  }
+  return { ...local, ...google };
 }
 
 /** Returns no fallback when Gemini is disabled, or fails closed for partial setup. */

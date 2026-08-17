@@ -1,7 +1,7 @@
 {
   "name": "discord-calendar-assistant",
   "version": "0.1.0",
-  "description": "A personal Discord DM assistant for Google Calendar.",
+  "description": "A personal Discord DM assistant for local tasks and optional Google Calendar.",
   "private": true,
   "type": "module",
   "engines": {

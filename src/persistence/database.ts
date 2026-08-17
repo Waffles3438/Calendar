@@ -74,6 +74,49 @@ const MIGRATIONS: readonly Migration[] = [
         ON oauth_authorization_states(expires_at);
     `,
   },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE IF NOT EXISTS local_tasks (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        encrypted_title TEXT NOT NULL,
+        due_at TEXT NOT NULL,
+        time_zone TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'cancelled')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        cancelled_at TEXT,
+        revision INTEGER NOT NULL CHECK(revision >= 1)
+      );
+      CREATE INDEX IF NOT EXISTS local_tasks_active_due_index
+        ON local_tasks(owner_id, due_at)
+        WHERE status = 'active';
+
+      CREATE TABLE IF NOT EXISTS local_task_reminder_deliveries (
+        task_id TEXT NOT NULL REFERENCES local_tasks(id),
+        scheduled_for TEXT NOT NULL,
+        sent_at TEXT NOT NULL,
+        PRIMARY KEY(task_id, scheduled_for)
+      );
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      CREATE TABLE IF NOT EXISTS local_task_reminder_claims (
+        task_id TEXT NOT NULL REFERENCES local_tasks(id),
+        scheduled_for TEXT NOT NULL,
+        claim_token TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        PRIMARY KEY(task_id, scheduled_for)
+      );
+      CREATE INDEX IF NOT EXISTS local_task_reminder_claims_expiry_index
+        ON local_task_reminder_claims(lease_expires_at);
+    `,
+  },
 ];
 
 export class SqliteStore {

@@ -72,9 +72,7 @@ describe("GeminiStructuredCommandPlanner", () => {
     });
     expect(call?.request).not.toHaveProperty("tools");
     expect(call?.options).toEqual({
-      maxRetries: 0,
-      retries: { strategy: "none" },
-      timeout: GEMINI_REQUEST_TIMEOUT_MILLISECONDS,
+      timeout_ms: GEMINI_REQUEST_TIMEOUT_MILLISECONDS,
     });
 
     const prompt = String(call?.request.input);

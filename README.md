@@ -1,21 +1,38 @@
-# Discord Calendar Assistant
+# Discord Calendar and Task Assistant
 
-A single-owner Discord DM bot for Google Calendar. It reads the configured owner’s calendar, sends reminder DMs, and supports safe natural-language calendar changes. Common commands use a deterministic parser; an optional Gemini fallback handles unsupported wording without receiving calendar events, OAuth credentials, Discord data, or execution access.
+A single-owner Discord DM bot for private local tasks and optional Google Calendar access. Local tasks are stored encrypted in SQLite, use a configured IANA time zone (default `America/Toronto`), and can repeat reminder DMs until completed or cancelled. Common commands use deterministic parsing; an optional Gemini fallback handles unsupported wording without receiving task rows, calendar events, OAuth credentials, Discord metadata, or execution access.
 
 ## Operating model
 
 - **One person, direct messages only.** The bot ignores guild messages, bot messages, and DMs from everyone except `DISCORD_OWNER_ID`.
-- **No setup wizard or public onboarding.** The configured owner starts Google authorization by sending `/connect` in a DM.
-- **Safe writes.** Ambiguous targets, deletes, attendee changes, recurring-series changes, guest-impacting changes, and every Gemini-proposed mutation require a one-time `confirm <id>` reply. `cancel <id>` stops a pending action.
-- **Least-privilege Google access.** The app requests `calendar.events` plus read-only calendar-list access; it does not use a service account.
-- **Optional hosted AI.** Gemini is disabled unless both Gemini variables are configured. The deterministic parser and reminders work without it.
+- **Local tasks work without Google.** Configure Discord, the owner ID, and `ENCRYPTION_KEY` to use tasks even if Google is unconfigured, disconnected, or unavailable.
+- **Safe writes.** Ambiguous task matches, calendar writes with meaningful impact, and every Gemini-proposed mutation require a one-time `confirm <id>` reply. `cancel <id>` stops a pending action.
+- **Least-privilege Google access.** When enabled, the app requests `calendar.events` plus read-only calendar-list access; it does not use a service account.
+- **Optional hosted AI.** Gemini is disabled unless both Gemini variables are configured. Deterministic task/calendar parsing and reminders work without it.
+
+## Local tasks
+
+Use local task commands in an owner DM. They never create a Google Calendar event or Google Tasks item.
+
+| Command | Result |
+|---|---|
+| `remind me at 6pm tomorrow to run` | Creates a task due at the supplied Toronto local time. |
+| `create task pay hydro Friday at noon` | Creates a task using canonical task wording. |
+| `tasks` or `list tasks` | Lists active tasks in due-time order. |
+| `done run` or `complete task run` | Completes one clear active match; multiple matches produce `choose <id> <number>`. |
+| `cancel task run tomorrow` | Cancels a local task without affecting a Google Calendar event. |
+
+A task must include a title, a supplied date expression (`tomorrow`, a weekday, or `YYYY-MM-DD`), and a time. The bot does not guess a date for a time-only request. It rejects nonexistent or ambiguous Toronto daylight-saving wall times rather than silently changing the reminder instant.
+
+A task has nine scheduled reminder slots: at its due time and every 15 minutes through two hours afterward. Before sending a slot, the scheduler takes a durable claim and records the delivery after Discord accepts it, so overlapping workers sharing one SQLite database do not send the same live slot. Delivery is at-least-once, not exactly-once: a process crash or lease expiry after Discord accepts a DM but before durable completion can retry that slot. Completing or cancelling a task stops future slots. After downtime, the scheduler sends only the newest eligible missed slot inside that original two-hour window; it never sends a burst of old reminders. Recurring tasks, snooze, rescheduling, and task editing are intentionally out of scope in this version; recurring wording receives a clear unsupported response.
 
 ## Requirements
 
 - Node.js **22.15.0 through 22.x** and npm 11.11.0 (see `package.json`).
-- A Discord application with a bot token and the owner’s Discord user ID.
-- A Google Cloud OAuth client for a web application, with a public HTTPS callback URL.
-- For production: one Linux host with systemd, persistent writable storage for SQLite, and a TLS reverse proxy. The service itself is plain HTTP only.
+- A Discord application with a bot token, the owner’s Discord user ID, and an encryption key.
+- Optional: a Google Cloud OAuth client for Google Calendar access, with a public HTTPS callback URL.
+- Optional: a Gemini API key and supported model identifier for unsupported task/calendar wording.
+- For production: one Linux host with systemd, persistent writable storage for SQLite, and a TLS reverse proxy when Google OAuth is enabled. The service itself is plain HTTP only.
 
 ## Quick start
 
@@ -28,13 +45,13 @@ A single-owner Discord DM bot for Google Calendar. It reads the configured owner
    npm run build
    ```
 
-2. Copy `.env.example` to `.env`, populate the required values below, and generate a durable encryption secret. For example:
+2. Copy `.env.example` to `.env`, configure `DISCORD_BOT_TOKEN`, `DISCORD_OWNER_ID`, and `ENCRYPTION_KEY`, then generate a durable encryption secret. Google and Gemini settings are optional. For example:
 
    ```sh
    node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"
    ```
 
-   Keep that value private and unchanged after the first Google connection. Changing it makes existing encrypted OAuth credentials and pending actions unreadable.
+   Keep that value private and unchanged. Changing it makes encrypted OAuth credentials, local task titles, and pending actions unreadable.
 
 3. For a local run, load the file explicitly—this application does **not** load `.env` itself:
 
@@ -50,11 +67,11 @@ A single-owner Discord DM bot for Google Calendar. It reads the configured owner
    curl http://127.0.0.1:3000/healthz
    ```
 
-5. DM the bot from the configured owner account with `/connect`, open the returned Google authorization link, complete consent, then send `/status` to verify the selected calendar.
+5. DM the bot from the configured owner account with `remind me at 6pm tomorrow to run`, then use `tasks` to verify local task support. If Google OAuth settings are configured, send `/connect`, complete consent, then send `/status` to verify the selected calendar.
 
 ## Configuration
 
-Empty values are treated as unset. The bot starts in health-only mode when none of the six core integration variables are set; if any one is set, **all six** are required.
+Empty values are treated as unset. The bot starts in health-only mode when no local bot values are set. To enable Discord and local tasks, configure **all three** local values: `DISCORD_BOT_TOKEN`, `DISCORD_OWNER_ID`, and `ENCRYPTION_KEY`. Google Calendar remains optional and requires all three Google settings together. Gemini remains optional and requires both Gemini settings together.
 
 | Variable | Default | Purpose |
 |---|---:|---|
@@ -64,16 +81,17 @@ Empty values are treated as unset. The bot starts in health-only mode when none 
 | `LOG_LEVEL` | `info` | Pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`. |
 | `DATABASE_PATH` | `./data/calendar-bot.sqlite` | SQLite path. Use an absolute persistent path in production. |
 | `REMINDER_POLL_INTERVAL_SECONDS` | `60` | Reminder poll interval, 15–300 seconds. |
-| `DISCORD_BOT_TOKEN` | — | Discord bot token; required for the full integration. |
+| `LOCAL_TASK_TIME_ZONE` | `America/Toronto` | IANA zone used for local task parsing, storage display, and DST checks. |
+| `DISCORD_BOT_TOKEN` | — | Discord bot token; required for the local Discord/task runtime. |
 | `DISCORD_OWNER_ID` | — | The sole permitted Discord user ID (17–20 digits). |
-| `GOOGLE_CLIENT_ID` | — | Google OAuth web-client ID. |
-| `GOOGLE_CLIENT_SECRET` | — | Google OAuth web-client secret. |
-| `GOOGLE_REDIRECT_URI` | — | Exact public callback URL, normally `https://calendar.example.com/oauth/google/callback`. |
-| `ENCRYPTION_KEY` | — | Secret of at least 32 characters used to encrypt OAuth credentials and pending actions. |
+| `ENCRYPTION_KEY` | — | Secret of at least 32 characters used to encrypt OAuth credentials, pending actions, and local task titles. |
+| `GOOGLE_CLIENT_ID` | — | Optional Google OAuth web-client ID. |
+| `GOOGLE_CLIENT_SECRET` | — | Optional Google OAuth web-client secret. |
+| `GOOGLE_REDIRECT_URI` | — | Optional exact public callback URL, normally `https://calendar.example.com/oauth/google/callback`. |
 | `GEMINI_API_KEY` | — | Optional Gemini API key; requires `GEMINI_MODEL`. |
 | `GEMINI_MODEL` | — | Optional Gemini model identifier; requires `GEMINI_API_KEY`. |
 
-The required core set is `DISCORD_BOT_TOKEN`, `DISCORD_OWNER_ID`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, and `ENCRYPTION_KEY`. The Google values must be configured together; the Gemini values must be configured together.
+A local-task-only installation needs the three local values. Google Calendar features start only when all Google values are present; `/status` reports Google as unconfigured otherwise, and `/connect` / `/disconnect` explain that availability. The local task timezone must be a valid IANA timezone. `America/Toronto` observes DST, so date parsing and display follow Toronto’s current offset.
 
 ## Discord setup
 
@@ -109,11 +127,28 @@ Use the official [OAuth web-server guide](https://developers.google.com/identity
 
 ## Optional Gemini fallback
 
-Leave both `GEMINI_API_KEY` and `GEMINI_MODEL` empty to run without hosted AI. When enabled, Gemini is called only after the deterministic parser reports an unsupported intent; incomplete or failed model output falls back to the deterministic clarification without a calendar write.
+Leave both `GEMINI_API_KEY` and `GEMINI_MODEL` empty to run without hosted AI. When enabled, Gemini is called only after deterministic parsing reports an **unsupported** task-shaped or calendar request. A recognized command missing a title, date, or time is never sent to Gemini; the bot asks for that missing detail instead. Failed, incomplete, malformed, or unsafe model output falls back safely without a write.
 
-The planner receives only the owner’s unsupported request text, current time, and IANA time zone. It has no tools and no Calendar, OAuth, Discord, event-list, or database capability. Returned JSON is validated locally, and every model-proposed create, update, deletion, attendee edit, or reminder requires confirmation.
+### Enable Gemini
 
-Free-tier availability, quotas, supported models, regions, and pricing are provider-account dependent and can change. Do not assume a particular model remains free. Choose a compatible model identifier from your Google AI account, test it with the bot, and plan for quota failures to safely fall back to deterministic behavior. See Google’s [API-key guide](https://ai.google.dev/gemini-api/docs/api-key), [rate-limit reference](https://ai.google.dev/gemini-api/docs/rate-limits), and [pricing page](https://ai.google.dev/gemini-api/docs/pricing).
+1. Create an API key in your Gemini/Google AI account. Keep the key private; never commit, log, or paste it into chat or a support request.
+2. In your private environment file, set **both** values together:
+
+   ```ini
+   GEMINI_API_KEY=your-private-api-key
+   GEMINI_MODEL=your-supported-model-id
+   ```
+
+   `GEMINI_API_KEY` is the secret credential used to authenticate requests. `GEMINI_MODEL` is the non-secret, bare identifier of the Gemini model that should handle fallback parsing—it is **not** another API key. Copy a supported model identifier from your Gemini account; this application accepts only letters, numbers, `.`, `_`, and `-`, so do not use a URL or a `models/` prefix.
+3. Restart the bot after changing its environment. The application rejects a partial Gemini setup: both values must be set, or both must be blank.
+
+### Verify and troubleshoot Gemini safely
+
+Use a benign, complete, unsupported task-shaped request through the owner DM path to exercise the fallback; do not use personal task content or paste credentials into a command. A model-proposed mutation must be reviewed with `confirm <id>`; cancel the pending action instead of confirming it when testing only. If a generic structured-output smoke test or fallback yields no proposal, verify that both variables are present, the selected model supports Gemini Interactions structured JSON output, and the account has current provider availability and quota. Invalid, malformed, incomplete, or unsafe provider output is intentionally discarded without a write or a raw provider response in logs. See Google's [Interactions structured-output guide](https://ai.google.dev/gemini-api/docs/interactions/structured-output) for compatible request behavior.
+
+The calendar and local-task planners receive only the owner’s unsupported request text, current time, and the relevant IANA time zone. The task planner always uses `LOCAL_TASK_TIME_ZONE`; it does not receive task rows, task IDs, task history, calendar events, OAuth data, Discord metadata, database data, or tool access. Requests are storage-disabled where the Gemini SDK supports it, returned JSON is strictly validated locally, and every model-proposed local-task create/complete/cancel or Calendar mutation requires `confirm <id>`. Read-only task listing may execute directly.
+
+The Gemini key is never printed, logged, or written to repository files. Free-tier availability, quotas, supported models, regions, and pricing are provider-account dependent and can change. Do not assume a particular model remains free. Choose a compatible model identifier from your Google AI account and plan for quota failures to safely fall back to deterministic behavior. See Google’s [API-key guide](https://ai.google.dev/gemini-api/docs/api-key), [rate-limit reference](https://ai.google.dev/gemini-api/docs/rate-limits), and [pricing page](https://ai.google.dev/gemini-api/docs/pricing).
 
 ## HTTPS reverse proxy and health endpoints
 
@@ -167,13 +202,15 @@ PORT=3000
 DATABASE_PATH=/var/lib/discord-calendar-assistant/calendar-bot.sqlite
 LOG_LEVEL=info
 REMINDER_POLL_INTERVAL_SECONDS=60
+LOCAL_TASK_TIME_ZONE=America/Toronto
 DISCORD_BOT_TOKEN=replace-me
 DISCORD_OWNER_ID=123456789012345678
-GOOGLE_CLIENT_ID=replace-me.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=replace-me
-GOOGLE_REDIRECT_URI=https://calendar.example.com/oauth/google/callback
 ENCRYPTION_KEY=replace-with-a-durable-random-secret
-# Optional: include both or neither.
+# Optional Google Calendar integration: include all three or none.
+# GOOGLE_CLIENT_ID=replace-me.apps.googleusercontent.com
+# GOOGLE_CLIENT_SECRET=replace-me
+# GOOGLE_REDIRECT_URI=https://calendar.example.com/oauth/google/callback
+# Optional Gemini fallback: include both or neither.
 # GEMINI_API_KEY=replace-me
 # GEMINI_MODEL=replace-with-a-supported-model-id
 ```
@@ -188,12 +225,12 @@ sudo systemctl enable --now discord-calendar-assistant
 sudo systemctl status discord-calendar-assistant
 ```
 
-If Node is not `/usr/bin/node`, update `ExecStart` in the installed unit. Keep exactly one running instance: reminder delivery deduplication is persisted but is not a cross-process claim, so multiple replicas can send duplicate reminders.
+If Node is not `/usr/bin/node`, update `ExecStart` in the installed unit. Keep one running instance. Workers sharing a single SQLite database use durable reminder claims to prevent an overlapping send for a live slot, but one instance remains recommended: claims do not coordinate separate databases, and a Discord send cannot be atomic with the durable delivery record.
 
 ## Storage, backups, and logs
 
 - SQLite uses WAL mode. The service account needs write access to the database directory for the `.sqlite`, `-wal`, and `-shm` files—not merely the main database file.
-- OAuth credentials and pending actions are AES-GCM encrypted using `ENCRYPTION_KEY`; reminder and audit metadata are not full-database encrypted. Protect the host, the database directory, and the environment file accordingly.
+- OAuth credentials, pending actions, and local task titles are AES-GCM encrypted using `ENCRYPTION_KEY`; reminder delivery and claim/lease metadata, task lifecycle timestamps, and audit metadata are not full-database encrypted. Protect the host, the database directory, and the environment file accordingly.
 - Back up the database **and** the encryption key. For a simple filesystem backup, stop the service first, then copy/archive the database directory so the SQLite sidecar files are consistent:
 
   ```sh
@@ -215,15 +252,17 @@ If Node is not `/usr/bin/node`, update `ExecStart` in the installed unit. Keep e
 
 | Symptom | Check |
 |---|---|
-| Process starts in health-only mode | Configure all six core integration variables, not a partial set. Inspect `journalctl -u discord-calendar-assistant`. |
-| `Invalid configuration` on start | Verify paired Google and Gemini values, the owner ID format, port range, and the encryption key length. |
+| Process starts in health-only mode | Configure all three local bot values—Discord token, owner ID, and encryption key—not a partial set. Inspect `journalctl -u discord-calendar-assistant`. |
+| `Invalid configuration` on start | Verify the local task timezone, paired Google/Gemini values, owner ID format, port range, and encryption key length. |
+| Local task commands fail | Ensure the DM is from `DISCORD_OWNER_ID`, include a title/date/time, and check that `LOCAL_TASK_TIME_ZONE` is valid. Google does not need to be connected. |
+| Task reminder repeats unexpectedly | Reply `done <description>` or `cancel task <description>`; reminders repeat every 15 minutes only until two hours after the original due time. |
 | `redirect_uri_mismatch` from Google | Ensure the Console URI and `GOOGLE_REDIRECT_URI` match exactly and the reverse proxy forwards `/oauth/google/callback`. |
 | Google link succeeds but no usable connection | Re-run `/connect` and approve consent so Google returns or preserves a refresh token. |
 | Bot does not respond | DM it from the configured owner account, verify the bot token and owner ID, and check Discord DM/privacy permissions. Guild messages are intentionally ignored. |
-| Gemini is never used | Configure both Gemini variables, make sure the wording is unsupported by the deterministic parser, and check provider quota/model availability. |
-| A calendar mutation is not applied | Read the confirmation prompt, reply `confirm <id>` before it expires, and repeat the request if Google reports an ETag or series change. |
-| Reminders duplicate | Run one service instance only; a restart during delivery can also retry an unrecorded send. |
-| Reminders do not arrive | Check Discord DM availability, Google authorization, the service logs, calendar event status, and the configured poll interval. |
+| Gemini is never used | Configure both Gemini variables, use an unsupported task-shaped/calendar request with all required details, and check provider quota/model availability. |
+| A model-proposed task is not applied | Read the review prompt and reply `confirm <id>` before it expires. Deterministic canonical task commands do not need this confirmation. |
+| Reminders duplicate | Use one service instance with one shared SQLite database. Claims prevent an overlapping live-slot send, but a process crash or lease expiry after Discord accepts a DM and before durable completion can retry that slot; delivery is at-least-once. |
+| Reminders do not arrive | Check Discord DM availability, local task lifecycle status, service logs, the configured poll interval, and—only for calendar reminders—Google authorization. |
 
 ## Validation before release
 

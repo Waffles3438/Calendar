@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 
 import type { Logger } from "pino";
 
+import type {
+  PendingActionInstruction,
+  PendingActionMessageHandler,
+} from "./pending-action.js";
+
 import {
   calendarDateTimeToDateTime,
   calendarDayBounds,
@@ -276,6 +281,10 @@ function isPendingMutation(value: unknown): value is PendingMutation {
   );
 }
 
+export function isCalendarPendingActionPayload(value: unknown): boolean {
+  return isPendingMutation(value) || isPendingCreate(value) || isPendingReminder(value) || isPendingSelection(value);
+}
+
 function eventDisplayName(event: CalendarEvent, timeZone: string): string {
   return `${event.summary} (${formatEventStart(event, timeZone)})`;
 }
@@ -305,13 +314,56 @@ function sameWarnings(first: readonly SafetyWarning[], second: readonly SafetyWa
 }
 
 /** Executes deterministic commands only after calendar safety policy approval. */
-export class CalendarAssistant implements CalendarMessageHandler {
+export class CalendarAssistant implements CalendarMessageHandler, PendingActionMessageHandler {
   private readonly now: () => Date;
   private readonly pendingActionTtlMilliseconds: number;
 
   public constructor(private readonly options: CalendarAssistantOptions) {
     this.now = options.now ?? (() => new Date());
     this.pendingActionTtlMilliseconds = options.pendingActionTtlMilliseconds ?? 10 * 60 * 1_000;
+  }
+
+  public canHandlePendingAction(payload: unknown): boolean {
+    return isCalendarPendingActionPayload(payload);
+  }
+
+  /**
+   * OwnerCommandRouter calls this only after reading and discriminating the
+   * encrypted action payload, so task actions can never be consumed here.
+   */
+  public async handlePendingAction(
+    message: OwnerDirectMessage,
+    instruction: PendingActionInstruction,
+  ): Promise<boolean> {
+    const pending = this.options.stateRepository.getPendingAction({
+      id: instruction.actionId,
+      now: this.now(),
+      ownerId: this.options.ownerId,
+    });
+    if (!pending || !isCalendarPendingActionPayload(pending.payload)) {
+      return false;
+    }
+
+    if (instruction.kind === "confirm") {
+      if (!isPendingMutation(pending.payload) && !isPendingCreate(pending.payload) && !isPendingReminder(pending.payload)) {
+        await message.reply("That confirmation is invalid or has expired.");
+        return true;
+      }
+      await this.handleConfirmation(message, instruction.actionId);
+      return true;
+    }
+
+    if (instruction.kind === "cancel") {
+      await this.handleCancellation(message, instruction.actionId);
+      return true;
+    }
+
+    if (!isPendingSelection(pending.payload)) {
+      await message.reply("That selection is invalid or has expired.");
+      return true;
+    }
+    await this.handleSelection(message, instruction.actionId, instruction.choice);
+    return true;
   }
 
   public async handle(message: OwnerDirectMessage): Promise<void> {

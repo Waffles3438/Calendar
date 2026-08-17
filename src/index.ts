@@ -1,6 +1,11 @@
 import { CalendarAssistant } from "./application/calendar-assistant.js";
 import { OwnerCommandRouter } from "./application/owner-command-router.js";
-import { getBotIntegrationConfig, getGeminiFallbackConfig, loadConfig } from "./config.js";
+import {
+  getGeminiFallbackConfig,
+  getGoogleCalendarConfig,
+  getLocalBotConfig,
+  loadConfig,
+} from "./config.js";
 import { DiscordBot } from "./discord/discord-bot.js";
 import { GoogleCalendarApi } from "./google/calendar-api.js";
 import { GoogleOAuthCallbackHandler } from "./google/oauth-callback.js";
@@ -10,84 +15,127 @@ import { createLogger } from "./logger.js";
 import { GeminiStructuredCommandPlanner } from "./nlp/gemini-structured-planner.js";
 import { AppStateRepository } from "./persistence/state-repository.js";
 import { ReminderScheduler } from "./reminders/reminder-scheduler.js";
+import { GeminiStructuredTaskPlanner } from "./tasks/gemini-structured-task-planner.js";
+import { LocalTaskAssistant } from "./tasks/local-task-assistant.js";
+import { LocalTaskReminderScheduler } from "./tasks/local-task-reminder-scheduler.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config.LOG_LEVEL);
-  const integration = getBotIntegrationConfig(config);
+  const localIntegration = getLocalBotConfig(config);
+  const googleIntegration = getGoogleCalendarConfig(config);
   const geminiFallback = getGeminiFallbackConfig(config);
 
   let stateRepository: AppStateRepository | undefined;
   let discordBot: DiscordBot | undefined;
   let reminderScheduler: ReminderScheduler | undefined;
+  let localTaskReminderScheduler: LocalTaskReminderScheduler | undefined;
   let healthServer: HealthServer | undefined;
 
   try {
     let oauthCallback: GoogleOAuthCallbackHandler | undefined;
 
-    if (integration) {
+    if (localIntegration) {
       stateRepository = new AppStateRepository({
         databasePath: config.DATABASE_PATH,
-        encryptionSecret: integration.encryptionKey,
+        encryptionSecret: localIntegration.encryptionKey,
       });
-      const oauthService = new GoogleOAuthService({
-        provider: new GoogleApiOAuthProvider({
-          clientId: integration.googleClientId,
-          clientSecret: integration.googleClientSecret,
-          redirectUri: integration.googleRedirectUri,
-        }),
-        stateRepository,
-      });
-      const calendarGateway = new GoogleCalendarApi({
-        clientId: integration.googleClientId,
-        clientSecret: integration.googleClientSecret,
-        redirectUri: integration.googleRedirectUri,
-        stateRepository,
-      });
-      const commandPlanner = geminiFallback
-        ? new GeminiStructuredCommandPlanner({
+
+      const taskCommandPlanner = geminiFallback
+        ? new GeminiStructuredTaskPlanner({
           apiKey: geminiFallback.apiKey,
           model: geminiFallback.model,
         })
         : undefined;
-      const calendarAssistant = new CalendarAssistant({
-        calendarGateway,
-        ...(commandPlanner ? { commandPlanner } : {}),
+      const localTaskAssistant = new LocalTaskAssistant({
+        ...(taskCommandPlanner ? { commandPlanner: taskCommandPlanner } : {}),
         logger,
-        ownerId: integration.discordOwnerId,
+        ownerId: localIntegration.discordOwnerId,
         stateRepository,
+        timeZone: localIntegration.taskTimeZone,
       });
+
+      let calendarAssistant: CalendarAssistant | undefined;
+      let calendarGateway: GoogleCalendarApi | undefined;
+      let oauthService: GoogleOAuthService | undefined;
+      if (googleIntegration) {
+        oauthService = new GoogleOAuthService({
+          provider: new GoogleApiOAuthProvider({
+            clientId: googleIntegration.googleClientId,
+            clientSecret: googleIntegration.googleClientSecret,
+            redirectUri: googleIntegration.googleRedirectUri,
+          }),
+          stateRepository,
+        });
+        calendarGateway = new GoogleCalendarApi({
+          clientId: googleIntegration.googleClientId,
+          clientSecret: googleIntegration.googleClientSecret,
+          redirectUri: googleIntegration.googleRedirectUri,
+          stateRepository,
+        });
+        const calendarCommandPlanner = geminiFallback
+          ? new GeminiStructuredCommandPlanner({
+            apiKey: geminiFallback.apiKey,
+            model: geminiFallback.model,
+          })
+          : undefined;
+        calendarAssistant = new CalendarAssistant({
+          calendarGateway,
+          ...(calendarCommandPlanner ? { commandPlanner: calendarCommandPlanner } : {}),
+          logger,
+          ownerId: localIntegration.discordOwnerId,
+          stateRepository,
+        });
+      }
+
       const commandRouter = new OwnerCommandRouter({
-        calendarAssistant,
-        calendarReader: calendarGateway,
-        oauthService,
-        ownerId: integration.discordOwnerId,
+        ...(calendarAssistant ? { calendarAssistant } : {}),
+        ...(calendarGateway ? { calendarReader: calendarGateway } : {}),
+        ...(oauthService ? { oauthService } : {}),
+        localTaskAssistant,
+        ownerId: localIntegration.discordOwnerId,
         stateRepository,
+        taskTimeZone: localIntegration.taskTimeZone,
       });
       discordBot = new DiscordBot({
         logger,
         onOwnerDirectMessage: (message) => commandRouter.handle(message),
-        ownerId: integration.discordOwnerId,
-        token: integration.discordBotToken,
+        ownerId: localIntegration.discordOwnerId,
+        token: localIntegration.discordBotToken,
       });
-      reminderScheduler = new ReminderScheduler({
-        calendarGateway,
+      localTaskReminderScheduler = new LocalTaskReminderScheduler({
         logger,
+        ownerId: localIntegration.discordOwnerId,
         pollIntervalMilliseconds: config.REMINDER_POLL_INTERVAL_SECONDS * 1_000,
         sendOwnerMessage: async (content) => {
           await discordBot?.sendOwnerMessage(content);
         },
         stateRepository,
       });
-      oauthCallback = new GoogleOAuthCallbackHandler({
-        logger,
-        oauthService,
-        onAuthorized: async () => {
-          await discordBot?.sendOwnerMessage(
-            "Google Calendar is connected. Send /status to verify the primary calendar.",
-          );
-        },
-      });
+
+      if (calendarGateway) {
+        reminderScheduler = new ReminderScheduler({
+          calendarGateway,
+          logger,
+          pollIntervalMilliseconds: config.REMINDER_POLL_INTERVAL_SECONDS * 1_000,
+          sendOwnerMessage: async (content) => {
+            await discordBot?.sendOwnerMessage(content);
+          },
+          stateRepository,
+        });
+      }
+
+      if (oauthService) {
+        oauthCallback = new GoogleOAuthCallbackHandler({
+          logger,
+          oauthService,
+          onAuthorized: async () => {
+            await discordBot?.sendOwnerMessage(
+              "Google Calendar is connected. Send /status to verify the primary calendar.",
+            );
+          },
+        });
+      }
     }
 
     healthServer = await startHealthServer({
@@ -99,13 +147,15 @@ async function main(): Promise<void> {
 
     if (discordBot) {
       await discordBot.start();
+      localTaskReminderScheduler?.start();
       reminderScheduler?.start();
     } else {
       logger.warn(
-        "Starting in health-only mode; configure Discord, Google OAuth, and ENCRYPTION_KEY to enable the bot",
+        "Starting in health-only mode; configure DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY to enable Discord and local tasks",
       );
     }
   } catch (error: unknown) {
+    localTaskReminderScheduler?.stop();
     reminderScheduler?.stop();
     await discordBot?.stop();
     await healthServer?.close();
@@ -115,6 +165,7 @@ async function main(): Promise<void> {
 
   const shutdown = (signal: string): void => {
     logger.info({ signal }, "Shutting down");
+    localTaskReminderScheduler?.stop();
     reminderScheduler?.stop();
     void Promise.all([discordBot?.stop(), healthServer?.close()])
       .then(() => {

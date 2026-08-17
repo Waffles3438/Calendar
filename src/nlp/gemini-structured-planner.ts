@@ -8,7 +8,7 @@ import type { EventQuery, ParsedCalendarCommand } from "./deterministic-command-
 
 export const MAX_GEMINI_REQUEST_CHARACTERS = 1_200;
 export const MAX_GEMINI_RESPONSE_CHARACTERS = 8_192;
-export const GEMINI_REQUEST_TIMEOUT_MILLISECONDS = 2_500;
+export const GEMINI_REQUEST_TIMEOUT_MILLISECONDS = 10_000;
 
 const MAX_TITLE_CHARACTERS = 160;
 const MAX_SELECTOR_SUMMARY_CHARACTERS = 160;
@@ -205,9 +205,7 @@ export interface GeminiInteractionResponse {
 }
 
 export interface GeminiInteractionRequestOptions {
-  readonly maxRetries: 0;
-  readonly retries: { readonly strategy: "none" };
-  readonly timeout: number;
+  readonly timeout_ms: number;
 }
 
 /** A deliberately small adapter so the planner never exposes the Gemini SDK elsewhere. */
@@ -276,9 +274,7 @@ export class GeminiStructuredCommandPlanner implements CalendarCommandPlanner {
 
     try {
       const response = await this.client.create(request, {
-        maxRetries: 0,
-        retries: { strategy: "none" },
-        timeout: this.timeoutMilliseconds,
+        timeout_ms: this.timeoutMilliseconds,
       });
       if (typeof response.output_text !== "string" ||
         response.output_text.length === 0 ||
