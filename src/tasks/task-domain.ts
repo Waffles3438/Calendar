@@ -27,11 +27,24 @@ export interface CreateLocalTaskInput {
   readonly title: string;
 }
 
+export const MAX_BULK_LOCAL_TASK_CANCELLATIONS = 1_000;
+
 export interface LocalTaskTransitionInput {
   readonly expectedRevision: number;
   readonly id: string;
   readonly now: Date;
   readonly ownerId: string;
+}
+
+export interface LocalTaskCancellationTarget {
+  readonly expectedRevision: number;
+  readonly id: string;
+}
+
+export interface LocalTaskBulkCancellationInput {
+  readonly now: Date;
+  readonly ownerId: string;
+  readonly tasks: readonly LocalTaskCancellationTarget[];
 }
 
 export interface LocalTaskSelector {

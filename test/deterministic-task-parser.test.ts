@@ -23,6 +23,61 @@ describe("parseDeterministicTaskCommand", () => {
     });
   });
 
+  it("creates a relative-minute local task without requiring a date", () => {
+    expect(parseDeterministicTaskCommand("remind me in 30 mins to run", context())).toEqual({
+      date: "2026-08-17",
+      kind: "create",
+      time: "16:30",
+      title: "run",
+    });
+  });
+
+  it("calculates relative-minute tasks across minute boundaries, midnight, and spring-forward", () => {
+    expect(
+      parseDeterministicTaskCommand("remind me in 30 minutes to run", context("2026-08-17T20:00:30.001Z")),
+    ).toEqual({
+      date: "2026-08-17",
+      kind: "create",
+      time: "16:31",
+      title: "run",
+    });
+    expect(
+      parseDeterministicTaskCommand("remind me in 30 mins to run", context("2026-08-18T03:45:00.000Z")),
+    ).toEqual({
+      date: "2026-08-18",
+      kind: "create",
+      time: "00:15",
+      title: "run",
+    });
+    expect(
+      parseDeterministicTaskCommand("remind me in 30 mins to run", context("2026-03-08T06:45:00.000Z")),
+    ).toEqual({
+      date: "2026-03-08",
+      kind: "create",
+      time: "03:15",
+      title: "run",
+    });
+  });
+
+  it("rejects unsafe, nonpositive, and repeated-hour relative task times", () => {
+    expect(parseDeterministicTaskCommand("remind me in 0 mins to run", context())).toMatchObject({
+      kind: "clarify",
+      reason: "invalid_value",
+    });
+    expect(
+      parseDeterministicTaskCommand("remind me in 9007199254740992 mins to run", context()),
+    ).toMatchObject({
+      kind: "clarify",
+      reason: "invalid_value",
+    });
+    expect(
+      parseDeterministicTaskCommand("remind me in 30 mins to run", context("2026-11-01T04:45:00.000Z")),
+    ).toMatchObject({
+      kind: "clarify",
+      reason: "invalid_value",
+    });
+  });
+
   it("supports create-task syntax while preserving an explicit supplied date", () => {
     expect(parseDeterministicTaskCommand("create task pay hydro Friday at noon", context())).toEqual({
       date: "2026-08-21",
@@ -33,8 +88,8 @@ describe("parseDeterministicTaskCommand", () => {
   });
 
   it("does not claim Google event-reminder grammar or Calendar-oriented wording", () => {
-    expect(isTaskShapedInput("remind me 15 minutes before Friday's meeting")).toBe(false);
-    expect(parseDeterministicTaskCommand("remind me 15 minutes before Friday's meeting", context())).toEqual({
+    expect(isTaskShapedInput("remind me 15 mins before Friday's meeting")).toBe(false);
+    expect(parseDeterministicTaskCommand("remind me 15 mins before Friday's meeting", context())).toEqual({
       kind: "not_task",
     });
 
@@ -54,8 +109,15 @@ describe("parseDeterministicTaskCommand", () => {
     });
   });
 
-  it("parses list, completion, and explicit task cancellation commands without generic selectors", () => {
+  it("parses date-filtered task lists, completion, explicit cancellation, and delete commands", () => {
     expect(parseDeterministicTaskCommand("tasks", context())).toEqual({ kind: "list" });
+    expect(isTaskShapedInput("what tasks do I have today?")).toBe(true);
+    expect(parseDeterministicTaskCommand("what tasks do I have today?", context())).toEqual({
+      date: "2026-08-17",
+      kind: "list",
+    });
+    expect(isTaskShapedInput("what do I have today?")).toBe(false);
+    expect(isTaskShapedInput("what tasks do I have on my calendar today?")).toBe(false);
     expect(parseDeterministicTaskCommand("done run tomorrow", context())).toEqual({
       kind: "complete",
       selector: { date: "2026-08-18", title: "run" },
@@ -67,6 +129,21 @@ describe("parseDeterministicTaskCommand", () => {
     expect(parseDeterministicTaskCommand("cancel task run Friday", context())).toEqual({
       kind: "cancel",
       selector: { date: "2026-08-21", title: "run" },
+    });
+    expect(isTaskShapedInput("delete task run")).toBe(true);
+    expect(parseDeterministicTaskCommand("delete task run", context())).toEqual({
+      kind: "cancel",
+      selector: { title: "run" },
+    });
+    expect(isTaskShapedInput("delete all tasks")).toBe(true);
+    expect(parseDeterministicTaskCommand("delete all tasks", context())).toEqual({ kind: "cancel_all" });
+    expect(parseDeterministicTaskCommand("delete all tasks for today", context())).toEqual({
+      date: "2026-08-17",
+      kind: "cancel_all",
+    });
+    expect(parseDeterministicTaskCommand("delete all tasks after lunch", context())).toMatchObject({
+      kind: "clarify",
+      reason: "invalid_value",
     });
   });
 

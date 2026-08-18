@@ -10,8 +10,11 @@ import {
 import type { OwnerDirectMessage } from "../discord/owner-dm-handler.js";
 import type { PendingAction } from "../persistence/state-repository.js";
 import {
+  MAX_BULK_LOCAL_TASK_CANCELLATIONS,
   type CreateLocalTaskInput,
   type LocalTask,
+  type LocalTaskBulkCancellationInput,
+  type LocalTaskCancellationTarget,
   type LocalTaskOperation,
   type LocalTaskSelector,
   type LocalTaskTransitionInput,
@@ -25,11 +28,13 @@ import type { TaskCommandPlanner } from "./task-command-planner.js";
 import {
   formatTaskDueAt,
   localTaskDate,
+  localTaskDateBounds,
   validateLocalTaskDateTime,
 } from "./task-time.js";
 
 export interface LocalTaskStateRepository {
   cancelLocalTask(input: LocalTaskTransitionInput): LocalTask | undefined;
+  cancelLocalTasks(input: LocalTaskBulkCancellationInput): readonly LocalTask[] | undefined;
   completeLocalTask(input: LocalTaskTransitionInput): LocalTask | undefined;
   createLocalTask(input: CreateLocalTaskInput): LocalTask;
   createPendingAction(input: {
@@ -42,6 +47,12 @@ export interface LocalTaskStateRepository {
   getPendingAction(input: { id: string; now: Date; ownerId: string }): PendingAction | undefined;
   consumePendingAction(input: { id: string; now: Date; ownerId: string }): PendingAction | undefined;
   listActiveLocalTasks(input: { limit?: number; ownerId: string }): readonly LocalTask[];
+  listActiveLocalTasksInRange(input: {
+    dueAtEarliest: Date;
+    dueAtLatest: Date;
+    limit: number;
+    ownerId: string;
+  }): readonly LocalTask[];
   recordAudit(input: {
     actionType: string;
     actorId: string;
@@ -78,6 +89,12 @@ interface PendingTaskTransition {
   readonly taskId: string;
 }
 
+interface PendingTaskBulkCancellation {
+  readonly kind: "local_task_bulk_cancel";
+  readonly source: "deterministic";
+  readonly tasks: readonly LocalTaskCancellationTarget[];
+}
+
 interface PendingTaskSelection {
   readonly candidateIds: readonly string[];
   readonly kind: "local_task_selection";
@@ -85,7 +102,7 @@ interface PendingTaskSelection {
   readonly source: CommandSource;
 }
 
-type TaskPendingAction = PendingTaskCreate | PendingTaskSelection | PendingTaskTransition;
+type TaskPendingAction = PendingTaskBulkCancellation | PendingTaskCreate | PendingTaskSelection | PendingTaskTransition;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
@@ -119,6 +136,29 @@ function isPendingTaskTransition(value: unknown): value is PendingTaskTransition
     value.expectedRevision > 0;
 }
 
+function isLocalTaskCancellationTarget(value: unknown): value is LocalTaskCancellationTarget {
+  return isRecord(value) &&
+    typeof value.id === "string" &&
+    value.id.trim().length > 0 &&
+    typeof value.expectedRevision === "number" &&
+    Number.isInteger(value.expectedRevision) &&
+    value.expectedRevision > 0;
+}
+
+function isPendingTaskBulkCancellation(value: unknown): value is PendingTaskBulkCancellation {
+  if (!isRecord(value) ||
+    value.kind !== "local_task_bulk_cancel" ||
+    value.source !== "deterministic" ||
+    !Array.isArray(value.tasks) ||
+    value.tasks.length === 0 ||
+    value.tasks.length > MAX_BULK_LOCAL_TASK_CANCELLATIONS ||
+    !value.tasks.every(isLocalTaskCancellationTarget)) {
+    return false;
+  }
+
+  return new Set(value.tasks.map((task) => task.id)).size === value.tasks.length;
+}
+
 function isPendingTaskSelection(value: unknown): value is PendingTaskSelection {
   return isRecord(value) &&
     value.kind === "local_task_selection" &&
@@ -131,7 +171,10 @@ function isPendingTaskSelection(value: unknown): value is PendingTaskSelection {
 
 /** Allows owner-level dispatch to identify encrypted local-task actions safely. */
 export function isLocalTaskPendingActionPayload(value: unknown): value is TaskPendingAction {
-  return isPendingTaskCreate(value) || isPendingTaskSelection(value) || isPendingTaskTransition(value);
+  return isPendingTaskBulkCancellation(value) ||
+    isPendingTaskCreate(value) ||
+    isPendingTaskSelection(value) ||
+    isPendingTaskTransition(value);
 }
 
 /** Handles local task messages without reading from or writing to Google Calendar. */
@@ -214,12 +257,17 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     }
 
     if (instruction.kind === "confirm") {
-      if (!isPendingTaskCreate(pending.payload) && !isPendingTaskTransition(pending.payload)) {
+      if (!isPendingTaskBulkCancellation(pending.payload) &&
+        !isPendingTaskCreate(pending.payload) &&
+        !isPendingTaskTransition(pending.payload)) {
         await message.reply("That confirmation is invalid or has expired.");
         return true;
       }
       const consumed = this.consumeTaskPendingAction(instruction.actionId);
-      if (!consumed || (!isPendingTaskCreate(consumed) && !isPendingTaskTransition(consumed))) {
+      if (!consumed ||
+        (!isPendingTaskBulkCancellation(consumed) &&
+          !isPendingTaskCreate(consumed) &&
+          !isPendingTaskTransition(consumed))) {
         await message.reply("That confirmation is invalid or has expired.");
         return true;
       }
@@ -230,8 +278,10 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
           timeZone: consumed.timeZone,
           title: consumed.title,
         });
-      } else {
+      } else if (isPendingTaskTransition(consumed)) {
         await this.executeTransition(message, consumed.operation, consumed.taskId, consumed.expectedRevision);
+      } else {
+        await this.executeBulkCancellation(message, consumed.tasks);
       }
       return true;
     }
@@ -280,7 +330,15 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
       return;
     }
     if (command.kind === "list") {
-      await this.handleList(message);
+      await this.handleList(message, command.date);
+      return;
+    }
+    if (command.kind === "cancel_all") {
+      if (source !== "deterministic") {
+        await message.reply("Bulk local task deletion must use an explicit delete command.");
+        return;
+      }
+      await this.handleBulkCancellation(message, command.date);
       return;
     }
     if (command.kind === "create") {
@@ -302,24 +360,130 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     }
   }
 
-  private async handleList(message: OwnerDirectMessage): Promise<void> {
+  private async handleList(message: OwnerDirectMessage, date?: string): Promise<void> {
     const displayLimit = 20;
-    const tasks = this.options.stateRepository.listActiveLocalTasks({
-      limit: displayLimit + 1,
-      ownerId: this.options.ownerId,
-    });
+    const bounds = date ? localTaskDateBounds(date, this.options.timeZone) : undefined;
+    const tasks = date
+      ? bounds
+        ? this.options.stateRepository.listActiveLocalTasksInRange({
+          dueAtEarliest: bounds.earliest,
+          dueAtLatest: bounds.latest,
+          limit: displayLimit + 1,
+          ownerId: this.options.ownerId,
+        })
+        : []
+      : this.options.stateRepository.listActiveLocalTasks({
+        limit: displayLimit + 1,
+        ownerId: this.options.ownerId,
+      });
     if (tasks.length === 0) {
-      await message.reply("You have no active local tasks.");
+      await message.reply(`You have no active local tasks${date ? ` for ${date}` : ""}.`);
       return;
     }
 
     const visible = tasks.slice(0, displayLimit);
     const more = tasks.length > visible.length ? "\nMore active tasks exist; complete or cancel some to keep this list short." : "";
+    const heading = date
+      ? `Active local tasks for ${date} (${this.options.timeZone})`
+      : `Active local tasks (${this.options.timeZone})`;
     await message.reply(
-      `Active local tasks (${this.options.timeZone}):\n${visible
-        .map((task, index) => `${index + 1}. ${task.title} — ${formatTaskDueAt(task.dueAt, task.timeZone)}`)
+      `${heading}:\n${visible
+        .map((task, index) => `${index + 1}. ${task.title} — ${formatTaskDueAt(task.dueAt, date ? this.options.timeZone : task.timeZone)}`)
         .join("\n")}${more}`,
     );
+  }
+
+  private async handleBulkCancellation(message: OwnerDirectMessage, date?: string): Promise<void> {
+    const tasks = this.findBulkCancellationTasks(date);
+    const scope = date ? ` for ${date}` : "";
+    if (tasks.length === 0) {
+      await message.reply(`You have no active local tasks${scope}.`);
+      return;
+    }
+    if (tasks.length > MAX_BULK_LOCAL_TASK_CANCELLATIONS) {
+      await message.reply(
+        `I found more than ${MAX_BULK_LOCAL_TASK_CANCELLATIONS} active local tasks${scope}. Narrow the request before deleting them.`,
+      );
+      return;
+    }
+
+    if (date && tasks.length === 1) {
+      const task = tasks[0];
+      if (task) {
+        await this.executeTransition(message, "cancel", task.id, task.revision);
+      }
+      return;
+    }
+
+    await this.queueBulkCancellationConfirmation(message, tasks, date);
+  }
+
+  private findBulkCancellationTasks(date?: string): readonly LocalTask[] {
+    const limit = MAX_BULK_LOCAL_TASK_CANCELLATIONS + 1;
+    if (!date) {
+      return this.options.stateRepository.listActiveLocalTasks({
+        limit,
+        ownerId: this.options.ownerId,
+      });
+    }
+
+    const bounds = localTaskDateBounds(date, this.options.timeZone);
+    return bounds
+      ? this.options.stateRepository.listActiveLocalTasksInRange({
+        dueAtEarliest: bounds.earliest,
+        dueAtLatest: bounds.latest,
+        limit,
+        ownerId: this.options.ownerId,
+      })
+      : [];
+  }
+
+  private async queueBulkCancellationConfirmation(
+    message: OwnerDirectMessage,
+    tasks: readonly LocalTask[],
+    date?: string,
+  ): Promise<void> {
+    const id = randomUUID();
+    this.options.stateRepository.createPendingAction({
+      expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
+      id,
+      ownerId: this.options.ownerId,
+      payload: {
+        kind: "local_task_bulk_cancel",
+        source: "deterministic",
+        tasks: tasks.map((task) => ({ expectedRevision: task.revision, id: task.id })),
+      } satisfies PendingTaskBulkCancellation,
+    });
+    const scope = date ? ` for ${date}` : "";
+    const count = tasks.length;
+    await message.reply(
+      `Review: delete ${count} active local task${count === 1 ? "" : "s"}${scope}. This will cancel ${count === 1 ? "it" : "them"} and stop future reminders. Reply confirm ${id} to continue or cancel ${id} to stop.`,
+    );
+  }
+
+  private async executeBulkCancellation(
+    message: OwnerDirectMessage,
+    tasks: readonly LocalTaskCancellationTarget[],
+  ): Promise<void> {
+    try {
+      const cancelled = this.options.stateRepository.cancelLocalTasks({
+        now: this.now(),
+        ownerId: this.options.ownerId,
+        tasks,
+      });
+      if (!cancelled) {
+        this.audit("local_task_bulk_cancel", { count: tasks.length, reason: "tasks_changed" }, "failed");
+        await message.reply("One or more local tasks changed before they could be deleted. No tasks were changed; please repeat the request.");
+        return;
+      }
+
+      this.audit("local_task_bulk_cancel", { count: cancelled.length }, "succeeded");
+      await message.reply(`Cancelled ${cancelled.length} local task${cancelled.length === 1 ? "" : "s"}.`);
+    } catch (error: unknown) {
+      this.audit("local_task_bulk_cancel", { count: tasks.length }, "failed");
+      this.options.logger.error({ error, taskCount: tasks.length }, "Local task bulk cancellation failed");
+      await message.reply("I could not safely delete those local tasks. Please try again.");
+    }
   }
 
   private async handleTransitionCommand(

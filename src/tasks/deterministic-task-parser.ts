@@ -12,9 +12,10 @@ export type TaskClarificationReason = "invalid_value" | "missing_required_detail
 
 export type ParsedTaskCommand =
   | { readonly kind: "cancel"; readonly selector: LocalTaskSelector }
+  | { readonly date?: string; readonly kind: "cancel_all" }
   | { readonly date: string; readonly kind: "create"; readonly time: string; readonly title: string }
   | { readonly kind: "complete"; readonly selector: LocalTaskSelector }
-  | { readonly kind: "list" }
+  | { readonly date?: string; readonly kind: "list" }
   | { readonly kind: "not_task" }
   | { readonly kind: "recurrence_unsupported" }
   | { readonly kind: "clarify"; readonly message: string; readonly reason: TaskClarificationReason };
@@ -48,9 +49,12 @@ const WEEKDAYS: Readonly<Record<string, number>> = {
 };
 
 const EVENT_REMINDER = /^remind\s+me\s+\d+\s*(?:minutes?|mins?)\s+before\b/iu;
+const RELATIVE_MINUTE_REMINDER = /^in\s+(\d+)\s*(?:minutes?|mins?)$/iu;
 const RECURRENCE_WORDS = /\b(?:every|each|daily|weekly|monthly|yearly)\b/iu;
 const CALENDAR_CUES = /\b(?:calendar|event|meeting|appointment|schedule)\b/iu;
 const GENERIC_SELECTOR_TERMS = new Set(["a", "an", "complete", "done", "task", "the", "to"]);
+const LIST_DATE_PATTERN = /^(?:today|tomorrow|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|\d{4}-\d{2}-\d{2})$/iu;
+const LIST_COMMAND_PREFIX = /^(?:tasks?|list(?:\s+my)?\s+tasks?|show(?:\s+my)?\s+tasks?|(?:what|which)\s+(?:my\s+)?tasks?\s+do\s+i\s+have)(.*)$/iu;
 
 /** Returns true only for input that is explicitly task-oriented, never calendar reminders. */
 export function isTaskShapedInput(input: string): boolean {
@@ -59,7 +63,15 @@ export function isTaskShapedInput(input: string): boolean {
     return false;
   }
 
-  const explicitTaskCommand = /^(?:tasks?|list\s+(?:my\s+)?tasks?|show\s+(?:my\s+)?tasks?|remind\s+me\b|(?:create|add)\s+(?:a\s+)?task\b|done\b|complete\b|cancel\s+task\b|to[ -]?do\b)/iu.test(text);
+  if (isTaskListSyntax(text)) {
+    return true;
+  }
+
+  if (/^delete\s+all\s+tasks\b/iu.test(text)) {
+    return true;
+  }
+
+  const explicitTaskCommand = /^(?:remind\s+me\b|(?:create|add)\s+(?:a\s+)?task\b|done\b|complete\b|(?:cancel|delete)\s+task\b|to[ -]?do\b)/iu.test(text);
   if (explicitTaskCommand) {
     return true;
   }
@@ -82,8 +94,9 @@ export function parseDeterministicTaskCommand(
   }
   const now = DateTime.fromJSDate(context.now, { zone: context.timeZone });
 
-  if (isListCommand(text)) {
-    return { kind: "list" };
+  const listCommand = parseListCommand(text, now);
+  if (listCommand) {
+    return listCommand;
   }
 
   if (RECURRENCE_WORDS.test(text)) {
@@ -94,7 +107,11 @@ export function parseDeterministicTaskCommand(
     return parseCompletionCommand(text, now);
   }
 
-  if (/^cancel\s+task\b/iu.test(text)) {
+  if (/^delete\s+all\s+tasks\b/iu.test(text)) {
+    return parseBulkCancellationCommand(text, now);
+  }
+
+  if (/^(?:cancel|delete)\s+task\b/iu.test(text)) {
     return parseCancellationCommand(text, now);
   }
 
@@ -110,8 +127,38 @@ export function parseDeterministicTaskCommand(
   return clarify("I couldn't determine a local task command.", "unsupported_intent");
 }
 
-function isListCommand(text: string): boolean {
-  return /^(?:tasks|list(?:\s+(?:my\s+)?)?tasks|show(?:\s+my)?\s+tasks)$/iu.test(text);
+function parseListCommand(text: string, now: DateTime): ParsedTaskCommand | undefined {
+  const suffix = taskListSuffix(text);
+  if (suffix === undefined) {
+    return undefined;
+  }
+  if (!suffix) {
+    return { kind: "list" };
+  }
+
+  const resolvedDate = resolveDate(suffix, now);
+  return "state" in resolvedDate
+    ? clarifyForDate(resolvedDate)
+    : { date: resolvedDate.date, kind: "list" };
+}
+
+function isTaskListSyntax(text: string): boolean {
+  const suffix = taskListSuffix(text);
+  return suffix !== undefined && (!suffix || LIST_DATE_PATTERN.test(suffix));
+}
+
+function taskListSuffix(text: string): string | undefined {
+  const match = LIST_COMMAND_PREFIX.exec(text);
+  if (!match) {
+    return undefined;
+  }
+
+  return (match[1] ?? "")
+    .trim()
+    .replace(/\?$/u, "")
+    .trim()
+    .replace(/^(?:on|for)\s+/iu, "")
+    .trim();
 }
 
 function parseReminderTask(text: string, now: DateTime, timeZone: string): ParsedTaskCommand {
@@ -127,7 +174,36 @@ function parseReminderTask(text: string, now: DateTime, timeZone: string): Parse
     return clarify("Please specify a task title.");
   }
 
+  const relativeMinuteMatch = RELATIVE_MINUTE_REMINDER.exec(schedulingText);
+  if (relativeMinuteMatch) {
+    return parseRelativeMinuteReminder(title, relativeMinuteMatch[1] ?? "", now, timeZone);
+  }
+
   return parseScheduledTask(title, schedulingText, now, timeZone);
+}
+
+function parseRelativeMinuteReminder(
+  title: string,
+  minutesText: string,
+  now: DateTime,
+  timeZone: string,
+): ParsedTaskCommand {
+  const minutes = Number(minutesText);
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) {
+    return clarify("Please specify a positive whole number of minutes.", "invalid_value");
+  }
+
+  const dueAt = now.plus({ minutes });
+  const roundedDueAt = dueAt.second === 0 && dueAt.millisecond === 0
+    ? dueAt
+    : dueAt.startOf("minute").plus({ minutes: 1 });
+  return finalizeCreate(
+    title,
+    roundedDueAt.toFormat("yyyy-LL-dd"),
+    roundedDueAt.toFormat("HH:mm"),
+    now,
+    timeZone,
+  );
 }
 
 function parseCreateTaskBody(body: string, now: DateTime, timeZone: string): ParsedTaskCommand {
@@ -207,8 +283,31 @@ function parseCompletionCommand(text: string, now: DateTime): ParsedTaskCommand 
   return "message" in selector ? clarify(selector.message) : { kind: "complete", selector: selector.selector };
 }
 
+function parseBulkCancellationCommand(text: string, now: DateTime): ParsedTaskCommand {
+  const match = /^delete\s+all\s+tasks(?:\s+(?:for|on)\b(.*))?$/iu.exec(text);
+  if (!match) {
+    return clarify("Use 'delete all tasks' or 'delete all tasks for today'.", "invalid_value");
+  }
+
+  const scope = match[1]?.trim();
+  if (scope === undefined) {
+    return { kind: "cancel_all" };
+  }
+  if (!scope) {
+    return clarify("Please specify a task date after 'for'.");
+  }
+  if (!LIST_DATE_PATTERN.test(scope)) {
+    return clarify("Please provide a valid task date.", "invalid_value");
+  }
+
+  const resolvedDate = resolveDate(scope, now);
+  return "state" in resolvedDate
+    ? clarifyForDate(resolvedDate)
+    : { date: resolvedDate.date, kind: "cancel_all" };
+}
+
 function parseCancellationCommand(text: string, now: DateTime): ParsedTaskCommand {
-  const body = text.replace(/^cancel\s+task\b\s*/iu, "");
+  const body = text.replace(/^(?:cancel|delete)\s+task\b\s*/iu, "");
   const selector = parseSelector(body, now);
   return "message" in selector ? clarify(selector.message) : { kind: "cancel", selector: selector.selector };
 }

@@ -66,6 +66,27 @@ describe("OwnerCommandRouter task-only mode", () => {
     expect(calendarHandle).not.toHaveBeenCalled();
   });
 
+  it("routes natural-language task-list wording before the Calendar fallback", async () => {
+    const taskHandle = vi.fn(async () => undefined);
+    const calendarHandle = vi.fn(async () => undefined);
+    const router = new OwnerCommandRouter({
+      calendarAssistant: { handle: calendarHandle },
+      localTaskAssistant: {
+        canHandlePendingAction: () => false,
+        handle: taskHandle,
+        handlePendingAction: async () => false,
+        isTaskInput: isTaskShapedInput,
+      },
+      ownerId,
+      stateRepository: {},
+    });
+
+    await router.handle(message("what tasks do I have today?"));
+
+    expect(taskHandle).toHaveBeenCalledTimes(1);
+    expect(calendarHandle).not.toHaveBeenCalled();
+  });
+
   it("keeps Calendar-oriented remember-to wording on the Calendar fallback path", async () => {
     const taskHandle = vi.fn(async () => undefined);
     const calendarHandle = vi.fn(async () => undefined);
@@ -82,9 +103,10 @@ describe("OwnerCommandRouter task-only mode", () => {
     });
 
     await router.handle(message("remember to schedule a meeting on my calendar tomorrow"));
+    await router.handle(message("what tasks do I have on my calendar today?"));
 
     expect(taskHandle).not.toHaveBeenCalled();
-    expect(calendarHandle).toHaveBeenCalledTimes(1);
+    expect(calendarHandle).toHaveBeenCalledTimes(2);
   });
 
   it("dispatches a pending local-task transition without allowing the calendar handler to consume it", async () => {

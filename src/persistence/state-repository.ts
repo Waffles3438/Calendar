@@ -4,8 +4,10 @@ import { z } from "zod";
 
 import { MAX_REMINDER_MINUTES } from "../reminders/reminder-limits.js";
 import {
+  MAX_BULK_LOCAL_TASK_CANCELLATIONS,
   type CreateLocalTaskInput,
   type LocalTask,
+  type LocalTaskBulkCancellationInput,
   type LocalTaskTransitionInput,
 } from "../tasks/task-domain.js";
 import { isValidTaskTimeZone } from "../tasks/task-time.js";
@@ -159,6 +161,8 @@ interface LocalTaskRow {
   readonly time_zone: string;
   readonly updated_at: string;
 }
+
+class LocalTaskBulkCancellationConflict extends Error { }
 
 function assertValidDate(value: Date, name: string): void {
   if (Number.isNaN(value.valueOf())) {
@@ -480,6 +484,43 @@ export class AppStateRepository {
     return rows.map((row) => this.toLocalTask(row));
   }
 
+  public listActiveLocalTasksInRange(input: {
+    dueAtEarliest: Date;
+    dueAtLatest: Date;
+    limit: number;
+    ownerId: string;
+  }): readonly LocalTask[] {
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertValidDate(input.dueAtEarliest, "dueAtEarliest");
+    assertValidDate(input.dueAtLatest, "dueAtLatest");
+    if (input.dueAtEarliest > input.dueAtLatest) {
+      throw new Error("dueAtEarliest must be before dueAtLatest");
+    }
+    if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 10_000) {
+      throw new Error("limit must be an integer between 1 and 10000");
+    }
+
+    const rows = this.store.connection
+      .prepare(
+        `
+          SELECT id, owner_id, encrypted_title, due_at, time_zone, status,
+                 created_at, updated_at, completed_at, cancelled_at, revision
+          FROM local_tasks
+          WHERE owner_id = ? AND status = 'active' AND due_at >= ? AND due_at <= ?
+          ORDER BY due_at ASC, id ASC
+          LIMIT ?
+        `,
+      )
+      .all(
+        input.ownerId,
+        input.dueAtEarliest.toISOString(),
+        input.dueAtLatest.toISOString(),
+        input.limit,
+      ) as LocalTaskRow[];
+
+    return rows.map((row) => this.toLocalTask(row));
+  }
+
   public listDueLocalTasks(input: DueLocalTaskQuery): readonly LocalTask[] {
     assertNonEmpty(input.ownerId, "ownerId");
     assertValidDate(input.dueAtEarliest, "dueAtEarliest");
@@ -509,6 +550,64 @@ export class AppStateRepository {
 
   public cancelLocalTask(input: LocalTaskTransitionInput): LocalTask | undefined {
     return this.transitionLocalTask(input, "cancelled");
+  }
+
+  /** Cancels an exact revision-checked task snapshot in one transaction. */
+  public cancelLocalTasks(input: LocalTaskBulkCancellationInput): readonly LocalTask[] | undefined {
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertValidDate(input.now, "now");
+    if (input.tasks.length === 0 || input.tasks.length > MAX_BULK_LOCAL_TASK_CANCELLATIONS) {
+      throw new Error(`tasks must contain between 1 and ${MAX_BULK_LOCAL_TASK_CANCELLATIONS} entries`);
+    }
+
+    const taskIds = new Set<string>();
+    for (const task of input.tasks) {
+      assertNonEmpty(task.id, "task id");
+      if (!Number.isInteger(task.expectedRevision) || task.expectedRevision < 1) {
+        throw new Error("task expectedRevision must be a positive integer");
+      }
+      if (taskIds.has(task.id)) {
+        throw new Error("tasks must not contain duplicate ids");
+      }
+      taskIds.add(task.id);
+    }
+
+    const timestamp = input.now.toISOString();
+    const cancel = this.store.connection.transaction((): readonly LocalTask[] => {
+      const update = this.store.connection.prepare(
+        `
+          UPDATE local_tasks
+          SET status = 'cancelled',
+              updated_at = ?,
+              cancelled_at = ?,
+              revision = revision + 1
+          WHERE id = ? AND owner_id = ? AND status = 'active' AND revision = ?
+        `,
+      );
+      const cancelled: LocalTask[] = [];
+      for (const task of input.tasks) {
+        const result = update.run(timestamp, timestamp, task.id, input.ownerId, task.expectedRevision);
+        if (result.changes !== 1) {
+          throw new LocalTaskBulkCancellationConflict();
+        }
+
+        const cancelledTask = this.getLocalTask({ id: task.id, ownerId: input.ownerId });
+        if (!cancelledTask) {
+          throw new LocalTaskBulkCancellationConflict();
+        }
+        cancelled.push(cancelledTask);
+      }
+      return cancelled;
+    });
+
+    try {
+      return cancel();
+    } catch (error) {
+      if (error instanceof LocalTaskBulkCancellationConflict) {
+        return undefined;
+      }
+      throw error;
+    }
   }
 
   /**

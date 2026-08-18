@@ -17,12 +17,16 @@ Use local task commands in an owner DM. They never create a Google Calendar even
 | Command | Result |
 |---|---|
 | `remind me at 6pm tomorrow to run` | Creates a task due at the supplied Toronto local time. |
+| `remind me in 30 mins to run` | Creates a task 30 minutes from now, using the configured local time zone. |
 | `create task pay hydro Friday at noon` | Creates a task using canonical task wording. |
 | `tasks` or `list tasks` | Lists active tasks in due-time order. |
+| `what tasks do I have today?` | Lists only active tasks due on the requested configured local date (Toronto by default). |
 | `done run` or `complete task run` | Completes one clear active match; multiple matches produce `choose <id> <number>`. |
-| `cancel task run tomorrow` | Cancels a local task without affecting a Google Calendar event. |
+| `cancel task run tomorrow` or `delete task run tomorrow` | Cancels one clear local task without affecting a Google Calendar event. |
+| `delete all tasks` | Reviews all active local tasks and requires `confirm <id>` before cancelling them. |
+| `delete all tasks for today` | Cancels one task due today immediately; reviews before cancelling multiple tasks due today. |
 
-A task must include a title, a supplied date expression (`tomorrow`, a weekday, or `YYYY-MM-DD`), and a time. The bot does not guess a date for a time-only request. It rejects nonexistent or ambiguous Toronto daylight-saving wall times rather than silently changing the reminder instant.
+Delete commands cancel tasks rather than erasing their encrypted history, which stops future local reminders while retaining the task lifecycle record. A task normally must include a title, a supplied date expression (`tomorrow`, a weekday, or `YYYY-MM-DD`), and a time. The exception is `remind me in <positive whole minutes> to <title>`: the bot calculates the due instant from the configured time zone and rounds up to minute precision so the reminder is never early. A time-only request such as `remind me at 6pm to run` still requires a date. Calendar wording such as `remind me 30 mins before <event>` remains a Google Calendar reminder, not a local task. The bot rejects nonexistent or ambiguous Toronto daylight-saving wall times rather than silently changing the reminder instant.
 
 A task has nine scheduled reminder slots: at its due time and every 15 minutes through two hours afterward. Before sending a slot, the scheduler takes a durable claim and records the delivery after Discord accepts it, so overlapping workers sharing one SQLite database do not send the same live slot. Delivery is at-least-once, not exactly-once: a process crash or lease expiry after Discord accepts a DM but before durable completion can retry that slot. Completing or cancelling a task stops future slots. After downtime, the scheduler sends only the newest eligible missed slot inside that original two-hour window; it never sends a burst of old reminders. Recurring tasks, snooze, rescheduling, and task editing are intentionally out of scope in this version; recurring wording receives a clear unsupported response.
 

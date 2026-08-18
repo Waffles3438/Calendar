@@ -70,6 +70,61 @@ describe("AppStateRepository local tasks", () => {
     expect(databaseContents).not.toContain("Private later task");
   });
 
+  it("cancels a task batch atomically while retaining cancellation history", async () => {
+    const { state } = await createRepository();
+    const first = state.createLocalTask(taskInput("batch-first", "First private task", "2026-08-18T22:00:00.000Z"));
+    const second = state.createLocalTask(taskInput("batch-second", "Second private task", "2026-08-19T22:00:00.000Z"));
+
+    const cancelled = state.cancelLocalTasks({
+      now: new Date("2026-08-17T12:05:00.000Z"),
+      ownerId,
+      tasks: [
+        { expectedRevision: first.revision, id: first.id },
+        { expectedRevision: second.revision, id: second.id },
+      ],
+    });
+
+    expect(cancelled?.map((task) => task.id)).toEqual([first.id, second.id]);
+    expect(state.getLocalTask({ id: first.id, ownerId })).toMatchObject({
+      cancelledAt: new Date("2026-08-17T12:05:00.000Z"),
+      revision: 2,
+      status: "cancelled",
+    });
+    expect(state.getLocalTask({ id: second.id, ownerId })).toMatchObject({ status: "cancelled" });
+    expect(state.listActiveLocalTasks({ ownerId })).toEqual([]);
+
+    const staleFirst = state.createLocalTask(taskInput("stale-first", "Stale first", "2026-08-20T22:00:00.000Z"));
+    const staleSecond = state.createLocalTask(taskInput("stale-second", "Stale second", "2026-08-21T22:00:00.000Z"));
+    expect(
+      state.cancelLocalTasks({
+        now: new Date("2026-08-17T12:10:00.000Z"),
+        ownerId,
+        tasks: [
+          { expectedRevision: staleFirst.revision, id: staleFirst.id },
+          { expectedRevision: staleSecond.revision + 1, id: staleSecond.id },
+        ],
+      }),
+    ).toBeUndefined();
+    expect(state.getLocalTask({ id: staleFirst.id, ownerId })).toMatchObject({ status: "active" });
+    expect(state.getLocalTask({ id: staleSecond.id, ownerId })).toMatchObject({ status: "active" });
+  });
+
+  it("selects active local tasks within a bounded due-date range", async () => {
+    const { state } = await createRepository();
+    state.createLocalTask(taskInput("range-earlier", "Earlier", "2026-08-17T18:00:00.000Z"));
+    state.createLocalTask(taskInput("range-later", "Later", "2026-08-17T19:00:00.000Z"));
+    state.createLocalTask(taskInput("range-outside", "Outside", "2026-08-17T21:00:00.000Z"));
+
+    expect(
+      state.listActiveLocalTasksInRange({
+        dueAtEarliest: new Date("2026-08-17T17:00:00.000Z"),
+        dueAtLatest: new Date("2026-08-17T20:00:00.000Z"),
+        limit: 1,
+        ownerId,
+      }).map((task) => task.id),
+    ).toEqual(["range-earlier"]);
+  });
+
   it("selects due active tasks and records reminder slots idempotently", async () => {
     const { state } = await createRepository();
     state.createLocalTask(taskInput("due-task", "Run", "2026-08-17T18:00:00.000Z"));

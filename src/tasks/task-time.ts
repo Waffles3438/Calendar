@@ -57,11 +57,25 @@ export function validateLocalTaskDateTime(
   return value ? { kind: "valid", value } : { kind: "invalid" };
 }
 
+export function localTaskDateBounds(
+  date: string,
+  timeZone: string,
+): { readonly earliest: Date; readonly latest: Date } | undefined {
+  if (!isValidTaskDate(date, timeZone)) {
+    return undefined;
+  }
+
+  const start = DateTime.fromFormat(date, "yyyy-LL-dd", { setZone: true, zone: timeZone }).startOf("day");
+  return start.isValid
+    ? { earliest: start.toUTC().toJSDate(), latest: start.endOf("day").toUTC().toJSDate() }
+    : undefined;
+}
+
 export function localTaskDate(dueAt: Date, timeZone: string): string {
   return DateTime.fromJSDate(dueAt, { zone: "utc" }).setZone(timeZone).toFormat("yyyy-LL-dd");
 }
 
-export function formatTaskDueAt(dueAt: Date, timeZone: string): string {
-  const local = DateTime.fromJSDate(dueAt, { zone: "utc" }).setZone(timeZone);
-  return `${local.toFormat("ccc, LLL d 'at' h:mm a")} (${timeZone})`;
+/** Lets Discord render the task instant in each recipient's locale and time zone. */
+export function formatTaskDueAt(dueAt: Date, _timeZone: string): string {
+  return `<t:${Math.floor(dueAt.valueOf() / 1_000)}:F>`;
 }

@@ -95,7 +95,7 @@ describe("parseDeterministicCommand", () => {
     });
     expect(
       parseDeterministicCommand(
-        "remind me 30 minutes before the 3pm meeting on Friday",
+        "remind me 30 mins before the 3pm meeting on Friday",
         context(),
       ),
     ).toEqual({
