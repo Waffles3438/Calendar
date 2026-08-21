@@ -109,3 +109,42 @@ describe("model provenance", () => {
     });
   });
 });
+
+
+describe("phase-one model auto-execution", () => {
+  it("allows an explicitly approved private model move", () => {
+    expect(
+      evaluateMutationSafety({
+        allowModelAutoExecution: true,
+        match: { candidateCount: 1, confidence: 0.95 },
+        operation: "update",
+        proposedByModel: true,
+        target: { hasExternalGuests: false, isRecurring: false },
+      }),
+    ).toEqual({ disposition: "proceed", reasons: [], warnings: [] });
+  });
+
+  it("keeps guest impact confirmation-required even when auto-execution is allowed", () => {
+    expect(
+      evaluateMutationSafety({
+        allowModelAutoExecution: true,
+        match: { candidateCount: 1, confidence: 0.95 },
+        operation: "update",
+        proposedByModel: true,
+        target: { hasExternalGuests: true, isRecurring: false },
+      }),
+    ).toEqual({ disposition: "require_confirmation", reasons: ["guest_impact"], warnings: [] });
+  });
+
+  it("does not let the auto-execution flag authorize non-phase-one deletion", () => {
+    expect(
+      evaluateMutationSafety({
+        allowModelAutoExecution: true,
+        match: { candidateCount: 1, confidence: 0.95 },
+        operation: "delete",
+        proposedByModel: true,
+        target: { hasExternalGuests: false, isRecurring: false },
+      }),
+    ).toEqual({ disposition: "require_confirmation", reasons: ["delete_event"], warnings: [] });
+  });
+});

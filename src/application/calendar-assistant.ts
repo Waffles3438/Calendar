@@ -6,6 +6,7 @@ import type {
   PendingActionInstruction,
   PendingActionMessageHandler,
 } from "./pending-action.js";
+import { markGeminiResponseUsed } from "./gemini-response-attribution.js";
 
 import {
   calendarDateTimeToDateTime,
@@ -28,7 +29,9 @@ import {
   type RecurrenceScope,
   type TimedEventDateTime,
 } from "../domain/calendar.js";
+import { formatDiscordDate, formatDiscordTimestamp } from "../discord/discord-timestamp.js";
 import type { OwnerDirectMessage } from "../discord/owner-dm-handler.js";
+import type { NaturalLanguageAction } from "../nlp/natural-language-action.js";
 import {
   isCalendarPreconditionFailure,
   type CalendarGateway,
@@ -85,6 +88,7 @@ export interface CalendarAssistantStateRepository {
 export interface CalendarAssistantOptions {
   readonly calendarGateway: CalendarGateway;
   readonly commandPlanner?: CalendarCommandPlanner;
+  readonly dryRun?: boolean;
   readonly logger: Logger;
   readonly now?: () => Date;
   readonly ownerId: string;
@@ -148,6 +152,8 @@ interface PendingMutation {
   readonly source: CommandSource;
   readonly warnings: readonly SafetyWarning[];
 }
+
+type CalendarPendingAction = PendingCreate | PendingMutation | PendingReminder | PendingSelection;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
@@ -281,8 +287,14 @@ function isPendingMutation(value: unknown): value is PendingMutation {
   );
 }
 
-export function isCalendarPendingActionPayload(value: unknown): boolean {
+export function isCalendarPendingActionPayload(value: unknown): value is CalendarPendingAction {
   return isPendingMutation(value) || isPendingCreate(value) || isPendingReminder(value) || isPendingSelection(value);
+}
+
+function markGeminiPendingAction(message: OwnerDirectMessage, pending: CalendarPendingAction): void {
+  if (pending.source === "gemini") {
+    markGeminiResponseUsed(message);
+  }
 }
 
 function eventDisplayName(event: CalendarEvent, timeZone: string): string {
@@ -299,6 +311,14 @@ function summaryTerms(summary: string | undefined): readonly string[] {
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter((term) => term.length > 1 && !generic.has(term));
+}
+
+function toEventQuery(selector: { readonly date: string; readonly summary?: string | undefined; readonly time?: string | undefined }): EventQuery {
+  return {
+    date: selector.date,
+    ...(selector.summary ? { summary: selector.summary } : {}),
+    ...(selector.time ? { time: selector.time } : {}),
+  };
 }
 
 function recurrenceScopeOf(command: MutationCommand): RecurrenceScope | undefined {
@@ -342,6 +362,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     });
     if (!pending || !isCalendarPendingActionPayload(pending.payload)) {
       return false;
+    }
+    markGeminiPendingAction(message, pending.payload);
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made.");
+      return true;
     }
 
     if (instruction.kind === "confirm") {
@@ -404,6 +429,7 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
             timeZone: primaryCalendar.timeZone,
           });
           if (planned && planned.kind !== "clarify") {
+            markGeminiResponseUsed(message);
             command = planned;
             source = "gemini";
           }
@@ -415,6 +441,84 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
       await this.handleCommand(message, primaryCalendar, command, source);
     } catch (error: unknown) {
       this.options.logger.error({ error }, "Calendar command failed");
+      await message.reply("I could not complete that calendar request. Please try again or use /status.");
+    }
+  }
+
+  public async handleNaturalLanguageAction(
+    message: OwnerDirectMessage,
+    action: Extract<NaturalLanguageAction, {
+      action: "create_calendar_event" | "delete_calendar_event" | "list_calendar" |
+      "manage_calendar_attendees" | "move_calendar_event" | "set_calendar_reminder";
+    }>,
+  ): Promise<void> {
+    try {
+      const primaryCalendar = await this.getPrimaryCalendar();
+      let command: ParsedCalendarCommand;
+      switch (action.action) {
+        case "list_calendar":
+          command = { date: action.date, kind: "list" };
+          break;
+        case "create_calendar_event": {
+          if (action.recurrence || action.calendarName) {
+            await message.reply("That calendar event needs the unified schedule path, which is not available right now.");
+            return;
+          }
+          const start = createTimedEventDateTime(action.date, action.startTime, primaryCalendar.timeZone);
+          const end = createTimedEventDateTime(
+            action.endDate ?? action.date,
+            action.endTime,
+            primaryCalendar.timeZone,
+          );
+          const durationMinutes = Math.round(
+            calendarDateTimeToDateTime(end, primaryCalendar.timeZone).diff(
+              calendarDateTimeToDateTime(start, primaryCalendar.timeZone),
+              "minutes",
+            ).minutes,
+          );
+          if (!Number.isInteger(durationMinutes) || durationMinutes <= 0) {
+            await message.reply("The event end time must be after its start time.");
+            return;
+          }
+          command = {
+            date: action.date,
+            durationMinutes,
+            kind: "create",
+            startTime: action.startTime,
+            title: action.title,
+          };
+          break;
+        }
+        case "move_calendar_event":
+          command = {
+            kind: "update",
+            newStartTime: action.newStartTime,
+            ...(action.recurrenceScope ? { recurrenceScope: action.recurrenceScope } : {}),
+            selector: toEventQuery(action.selector),
+          };
+          break;
+        case "delete_calendar_event":
+          command = {
+            kind: "delete",
+            ...(action.recurrenceScope ? { recurrenceScope: action.recurrenceScope } : {}),
+            selector: toEventQuery(action.selector),
+          };
+          break;
+        case "manage_calendar_attendees":
+          command = {
+            change: action.change,
+            kind: "manage_attendees",
+            ...(action.recurrenceScope ? { recurrenceScope: action.recurrenceScope } : {}),
+            selector: toEventQuery(action.selector),
+          };
+          break;
+        case "set_calendar_reminder":
+          command = { kind: "set_reminder", minutesBefore: action.minutesBefore, selector: toEventQuery(action.selector) };
+          break;
+      }
+      await this.handleCommand(message, primaryCalendar, command, "gemini");
+    } catch (error: unknown) {
+      this.options.logger.error({ error }, "Unified Calendar action failed");
       await message.reply("I could not complete that calendar request. Please try again or use /status.");
     }
   }
@@ -459,14 +563,15 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
       ...bounds,
     });
     const activeEvents = events.filter((event) => event.status !== "cancelled");
+    const displayDate = formatDiscordDate(localDate, calendar.timeZone);
 
     if (activeEvents.length === 0) {
-      await message.reply(`Nothing is scheduled on ${localDate} in ${calendar.summary}.`);
+      await message.reply(`Nothing is scheduled on ${displayDate} in ${calendar.summary}.`);
       return;
     }
 
     await message.reply(
-      `Schedule for ${localDate}:\n${activeEvents
+      `Schedule for ${displayDate}:\n${activeEvents
         .map((event, index) => `${index + 1}. ${eventDisplayName(event, calendar.timeZone)}`)
         .join("\n")}`,
     );
@@ -489,7 +594,7 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     const decision = evaluateMutationSafety({
       ...(conflicts.length > 0 ? { hasCalendarConflict: true } : {}),
       operation: "create",
-      ...(source === "gemini" ? { proposedByModel: true } : {}),
+      ...(source === "gemini" ? { allowModelAutoExecution: true, proposedByModel: true } : {}),
     });
 
     if (decision.disposition === "require_confirmation") {
@@ -505,6 +610,13 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
         title: command.title,
         warnings: decision.warnings,
       }, decision);
+      return;
+    }
+
+    if (this.options.dryRun) {
+      await message.reply(
+        `Dry run: would create ${command.title} at ${formatDiscordTimestamp(startDateTime.toUTC().toJSDate())}. No calendar change was made.${this.conflictSuffix(decision.warnings)}`,
+      );
       return;
     }
 
@@ -527,6 +639,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     calendar: CalendarReference,
     confirmationAccepted: boolean,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made.");
+      return;
+    }
+
     try {
       if (calendar.readOnly) {
         this.audit("create", { calendarId: pending.calendarId, reason: "read_only" }, "failed");
@@ -590,6 +707,9 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
       ? await this.findConflicts(calendar, patch.start, patch.end, target.id)
       : [];
     const scope = command.kind === "set_reminder" ? undefined : recurrenceScopeOf(command);
+    const allowModelAutoExecution = source === "gemini" &&
+      command.kind === "update" &&
+      Boolean(target && !isRecurringEvent(target));
     const decision = evaluateMutationSafety({
       ...(conflicts.length > 0 ? { hasCalendarConflict: true } : {}),
       ...(command.kind === "manage_attendees" ? { introducesAttendees: command.change.action === "add" } : {}),
@@ -598,6 +718,7 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
         confidence: match.confidence,
       },
       operation: command.kind,
+      ...(allowModelAutoExecution ? { allowModelAutoExecution: true } : {}),
       ...(source === "gemini" ? { proposedByModel: true } : {}),
       ...(scope ? { recurrenceScope: scope } : {}),
       ...(target
@@ -635,6 +756,13 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
           minutesBefore: command.minutesBefore,
           source,
         }, decision);
+        return;
+      }
+
+      if (this.options.dryRun) {
+        await message.reply(
+          `Dry run: would set a ${command.minutesBefore}-minute reminder for ${eventDisplayName(target, calendar.timeZone)}. No calendar change was made.`,
+        );
         return;
       }
 
@@ -691,6 +819,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
   }
 
   private async handleConfirmation(message: OwnerDirectMessage, actionId: string): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made.");
+      return;
+    }
+
     const pending = this.options.stateRepository.consumePendingAction({
       id: actionId,
       now: this.now(),
@@ -702,16 +835,19 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     }
 
     if (isPendingMutation(pending.payload)) {
+      markGeminiPendingAction(message, pending.payload);
       const calendar = await this.getCalendar(pending.payload.calendarId);
       await this.executeMutation(message, pending.payload, calendar, true);
       return;
     }
     if (isPendingCreate(pending.payload)) {
+      markGeminiPendingAction(message, pending.payload);
       const calendar = await this.getCalendar(pending.payload.calendarId);
       await this.executeCreate(message, pending.payload, calendar, true);
       return;
     }
     if (isPendingReminder(pending.payload)) {
+      markGeminiPendingAction(message, pending.payload);
       const calendar = await this.getCalendar(pending.payload.calendarId);
       await this.executeReminder(message, pending.payload, calendar, true);
       return;
@@ -726,6 +862,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     calendar: CalendarReference,
     confirmationAccepted: boolean,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made.");
+      return;
+    }
+
     const auditDetails = { calendarId: pending.calendarId, eventId: pending.eventId };
     try {
       if (calendar.readOnly) {
@@ -774,11 +915,19 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
   }
 
   private async handleCancellation(message: OwnerDirectMessage, actionId: string): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made.");
+      return;
+    }
+
     const pending = this.options.stateRepository.consumePendingAction({
       id: actionId,
       now: this.now(),
       ownerId: this.options.ownerId,
     });
+    if (pending && isCalendarPendingActionPayload(pending.payload)) {
+      markGeminiPendingAction(message, pending.payload);
+    }
     await message.reply(pending ? "Cancelled. No calendar change was made." : "That action is invalid or has expired.");
   }
 
@@ -787,6 +936,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     actionId: string,
     choice: number,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made.");
+      return;
+    }
+
     const pending = this.options.stateRepository.getPendingAction({
       id: actionId,
       now: this.now(),
@@ -796,6 +950,7 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
       await message.reply("That selection is invalid or has expired.");
       return;
     }
+    markGeminiPendingAction(message, pending.payload);
 
     const eventId = pending.payload.candidateIds[choice - 1];
     if (!eventId) {
@@ -1044,11 +1199,15 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
       const freshConflicts = conflictPatch
         ? await this.findConflicts(calendar, conflictPatch.start, conflictPatch.end, latest.id)
         : [];
+      const allowModelAutoExecution = mutation.source === "gemini" &&
+        mutation.operation === "update" &&
+        !isRecurringEvent(safetyTarget);
       const freshDecision = evaluateMutationSafety({
         ...(mutation.attendeeChange ? { introducesAttendees: mutation.attendeeChange.action === "add" } : {}),
         ...(freshConflicts.length > 0 ? { hasCalendarConflict: true } : {}),
         match: { candidateCount: 1, confidence: 0.99 },
         operation: mutation.operation,
+        ...(allowModelAutoExecution ? { allowModelAutoExecution: true } : {}),
         ...(mutation.source === "gemini" ? { proposedByModel: true } : {}),
         ...(scope ? { recurrenceScope: scope } : {}),
         target: {
@@ -1070,6 +1229,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
       }
       if (freshDecision.disposition === "require_confirmation" && !confirmationAccepted) {
         await this.rejectMutation(message, refreshedMutation, "This action requires confirmation before it can be applied.");
+        return;
+      }
+
+      if (this.options.dryRun) {
+        await message.reply("Dry run: no calendar change was made.");
         return;
       }
 
@@ -1188,6 +1352,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     candidates: readonly CalendarEvent[],
     source: CommandSource,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made; no event selection was stored.");
+      return;
+    }
+
     if (candidates.length === 0) {
       await message.reply("I could not find a matching event. Please include its title or time.");
       return;
@@ -1221,6 +1390,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     pending: PendingCreate,
     decision: MutationSafetyDecision,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made; no confirmation was stored.");
+      return;
+    }
+
     const id = randomUUID();
     this.options.stateRepository.createPendingAction({
       expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
@@ -1230,8 +1404,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     });
 
     const reason = decision.reasons.map((item) => item.replace(/_/gu, " ")).join(", ");
+    const scheduledFor = formatDiscordTimestamp(
+      calendarDateTimeToDateTime(pending.start, pending.start.timeZone).toUTC().toJSDate(),
+    );
     await message.reply(
-      `Review: create ${pending.title} at ${pending.start.dateTime}.${this.conflictSuffix(pending.warnings)} This action requires confirmation (${reason}). Reply confirm ${id} to continue or cancel ${id} to stop.`,
+      `Review: create ${pending.title} at ${scheduledFor}.${this.conflictSuffix(pending.warnings)} This action requires confirmation (${reason}). Reply confirm ${id} to continue or cancel ${id} to stop.`,
     );
   }
 
@@ -1240,6 +1417,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     pending: PendingReminder,
     decision: MutationSafetyDecision,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made; no confirmation was stored.");
+      return;
+    }
+
     const id = randomUUID();
     this.options.stateRepository.createPendingAction({
       expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
@@ -1259,6 +1441,11 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     mutation: PendingMutation,
     decision: MutationSafetyDecision,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no calendar change was made; no confirmation was stored.");
+      return;
+    }
+
     const id = randomUUID();
     this.options.stateRepository.createPendingAction({
       expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
@@ -1331,6 +1518,9 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     details: Record<string, unknown>,
     status: "failed" | "succeeded",
   ): void {
+    if (this.options.dryRun) {
+      return;
+    }
     this.options.stateRepository.recordAudit({
       actionType,
       actorId: this.options.ownerId,

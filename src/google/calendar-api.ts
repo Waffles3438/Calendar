@@ -262,36 +262,70 @@ function toGooglePatch(patch: CalendarEventPatch): calendar_v3.Schema$Event {
 }
 
 /** Google Calendar API adapter used by the Discord command layer. */
+/** Collects all Google list pages and fails closed on a malformed token cycle. */
+export async function collectGooglePages<T>(
+  fetchPage: (pageToken: string | undefined) => Promise<{
+    readonly items?: readonly T[] | null | undefined;
+    readonly nextPageToken?: string | null | undefined;
+  }>,
+): Promise<readonly T[]> {
+  const values: T[] = [];
+  const seenTokens = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const page = await fetchPage(pageToken);
+    values.push(...(page.items ?? []));
+    const next = page.nextPageToken ?? undefined;
+    if (next && seenTokens.has(next)) {
+      throw new GoogleCalendarConnectionError("Google Calendar returned a repeated page token");
+    }
+    if (next) {
+      seenTokens.add(next);
+    }
+    pageToken = next;
+  } while (pageToken);
+  return values;
+}
+
 export class GoogleCalendarApi implements CalendarGateway {
   public constructor(private readonly options: GoogleCalendarApiOptions) { }
 
   public async listCalendars(): Promise<readonly CalendarReference[]> {
     const calendar = this.createAuthenticatedCalendarClient();
-    const response = await calendar.calendarList.list({ showHidden: false });
-    const calendars: CalendarReference[] = [];
-
-    for (const entry of response.data.items ?? []) {
+    const entries = await collectGooglePages<GoogleCalendarListEntry>(async (pageToken) => {
+      const response = await calendar.calendarList.list({
+        ...(pageToken ? { pageToken } : {}),
+        showHidden: false,
+      });
+      return {
+        items: response.data.items as readonly GoogleCalendarListEntry[] | null | undefined,
+        nextPageToken: response.data.nextPageToken,
+      };
+    });
+    return entries.flatMap((entry) => {
       const normalized = normalizeGoogleCalendarReference(entry);
-      if (normalized) {
-        calendars.push(normalized);
-      }
-    }
-
-    return calendars;
+      return normalized ? [normalized] : [];
+    });
   }
 
   public async listEvents(input: ListCalendarEventsInput): Promise<readonly CalendarEvent[]> {
     const calendar = this.createAuthenticatedCalendarClient();
-    const response = await calendar.events.list({
-      calendarId: input.calendarId,
-      orderBy: "startTime",
-      showDeleted: false,
-      singleEvents: true,
-      timeMax: input.timeMax,
-      timeMin: input.timeMin,
+    const entries = await collectGooglePages<GoogleCalendarEvent>(async (pageToken) => {
+      const response = await calendar.events.list({
+        calendarId: input.calendarId,
+        orderBy: "startTime",
+        ...(pageToken ? { pageToken } : {}),
+        showDeleted: false,
+        singleEvents: true,
+        timeMax: input.timeMax,
+        timeMin: input.timeMin,
+      });
+      return {
+        items: response.data.items as readonly GoogleCalendarEvent[] | null | undefined,
+        nextPageToken: response.data.nextPageToken,
+      };
     });
-
-    return (response.data.items ?? []).flatMap((entry) => {
+    return entries.flatMap((entry) => {
       const normalized = normalizeGoogleCalendarEvent(entry, input.calendarId);
       return normalized ? [normalized] : [];
     });

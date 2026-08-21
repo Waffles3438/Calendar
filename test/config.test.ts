@@ -11,6 +11,8 @@ describe("loadConfig", () => {
   it("uses safe defaults for the standalone health service", () => {
     expect(loadConfig({})).toMatchObject({
       DATABASE_PATH: "./data/calendar-bot.sqlite",
+      GEMINI_NATURAL_LANGUAGE_ENABLED: true,
+      GEMINI_RESPONSE_LABEL_ENABLED: true,
       HOST: "127.0.0.1",
       LOG_LEVEL: "info",
       NODE_ENV: "development",
@@ -94,5 +96,35 @@ describe("getGeminiFallbackConfig", () => {
       apiKey: "key",
       model: "gemini-3.6-flash",
     });
+  });
+
+  it("supports a kill switch without removing the paired provider settings", () => {
+    const config = loadConfig({
+      GEMINI_API_KEY: "key",
+      GEMINI_MODEL: "gemini-3.6-flash",
+      GEMINI_NATURAL_LANGUAGE_ENABLED: "false",
+    });
+
+    expect(config.GEMINI_NATURAL_LANGUAGE_ENABLED).toBe(false);
+    expect(getGeminiFallbackConfig(config)).toBeUndefined();
+  });
+
+  it("can disable Gemini response labels without disabling Gemini itself", () => {
+    const config = loadConfig({
+      GEMINI_API_KEY: "key",
+      GEMINI_MODEL: "gemini-3.6-flash",
+      GEMINI_RESPONSE_LABEL_ENABLED: "false",
+    });
+
+    expect(config.GEMINI_RESPONSE_LABEL_ENABLED).toBe(false);
+    expect(getGeminiFallbackConfig(config)).toEqual({ apiKey: "key", model: "gemini-3.6-flash" });
+  });
+
+  it("rejects an invalid Gemini response-label flag", () => {
+    expect(() => loadConfig({ GEMINI_RESPONSE_LABEL_ENABLED: "maybe" })).toThrow(/boolean/u);
+  });
+
+  it("rejects an invalid natural-language rollout flag", () => {
+    expect(() => loadConfig({ GEMINI_NATURAL_LANGUAGE_ENABLED: "maybe" })).toThrow(/boolean/u);
   });
 });

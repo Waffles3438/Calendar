@@ -49,9 +49,10 @@ const WEEKDAYS: Readonly<Record<string, number>> = {
 };
 
 const EVENT_REMINDER = /^remind\s+me\s+\d+\s*(?:minutes?|mins?)\s+before\b/iu;
-const RELATIVE_MINUTE_REMINDER = /^in\s+(\d+)\s*(?:minutes?|mins?)$/iu;
+const RELATIVE_REMINDER = /^in\s+(\d+)\s*(hours?|hrs?|minutes?|mins?)$/iu;
 const RECURRENCE_WORDS = /\b(?:every|each|daily|weekly|monthly|yearly)\b/iu;
 const CALENDAR_CUES = /\b(?:calendar|event|meeting|appointment|schedule)\b/iu;
+const NATURAL_TASK_LIST_QUERY = /^(?:what\s+do\s+i\s+(?:need|have)\s+to\s+do|what\s+should\s+i\s+do)\b/iu;
 const GENERIC_SELECTOR_TERMS = new Set(["a", "an", "complete", "done", "task", "the", "to"]);
 const LIST_DATE_PATTERN = /^(?:today|tomorrow|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|\d{4}-\d{2}-\d{2})$/iu;
 const LIST_COMMAND_PREFIX = /^(?:tasks?|list(?:\s+my)?\s+tasks?|show(?:\s+my)?\s+tasks?|(?:what|which)\s+(?:my\s+)?tasks?\s+do\s+i\s+have)(.*)$/iu;
@@ -74,6 +75,12 @@ export function isTaskShapedInput(input: string): boolean {
   const explicitTaskCommand = /^(?:remind\s+me\b|(?:create|add)\s+(?:a\s+)?task\b|done\b|complete\b|(?:cancel|delete)\s+task\b|to[ -]?do\b)/iu.test(text);
   if (explicitTaskCommand) {
     return true;
+  }
+
+  // Route natural-language task questions to the task planner. The deterministic
+  // parser intentionally leaves them unsupported so Gemini must interpret them.
+  if (NATURAL_TASK_LIST_QUERY.test(text)) {
+    return !CALENDAR_CUES.test(text);
   }
 
   // Preserve the existing Calendar fallback for requests that explicitly describe calendar work.
@@ -174,26 +181,27 @@ function parseReminderTask(text: string, now: DateTime, timeZone: string): Parse
     return clarify("Please specify a task title.");
   }
 
-  const relativeMinuteMatch = RELATIVE_MINUTE_REMINDER.exec(schedulingText);
-  if (relativeMinuteMatch) {
-    return parseRelativeMinuteReminder(title, relativeMinuteMatch[1] ?? "", now, timeZone);
+  const relativeMatch = RELATIVE_REMINDER.exec(schedulingText);
+  if (relativeMatch) {
+    return parseRelativeReminder(title, relativeMatch[1] ?? "", relativeMatch[2] ?? "", now, timeZone);
   }
 
   return parseScheduledTask(title, schedulingText, now, timeZone);
 }
 
-function parseRelativeMinuteReminder(
+function parseRelativeReminder(
   title: string,
-  minutesText: string,
+  amountText: string,
+  unitText: string,
   now: DateTime,
   timeZone: string,
 ): ParsedTaskCommand {
-  const minutes = Number(minutesText);
-  if (!Number.isSafeInteger(minutes) || minutes <= 0) {
-    return clarify("Please specify a positive whole number of minutes.", "invalid_value");
+  const amount = Number(amountText);
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    return clarify("Please specify a positive whole number of hours or minutes.", "invalid_value");
   }
 
-  const dueAt = now.plus({ minutes });
+  const dueAt = /^h/iu.test(unitText) ? now.plus({ hours: amount }) : now.plus({ minutes: amount });
   const roundedDueAt = dueAt.second === 0 && dueAt.millisecond === 0
     ? dueAt
     : dueAt.startOf("minute").plus({ minutes: 1 });

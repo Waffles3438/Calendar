@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { CalendarAssistant } from "../src/application/calendar-assistant.js";
+import { withGeminiResponseAttribution } from "../src/application/gemini-response-attribution.js";
 import type {
   CalendarEvent,
   CalendarEventPatch,
@@ -305,6 +306,7 @@ describe("CalendarAssistant", () => {
       }),
     ]);
     expect(input.replies.join(" ")).toMatch(/created/i);
+    expect(input.replies.join(" ")).toMatch(/<t:\d+:F>/u);
   });
 
   it("requires explicit confirmation before changing an event with guests", async () => {
@@ -540,8 +542,34 @@ describe("CalendarAssistant Gemini fallback", () => {
     expect(gateway.createCalls[0]?.summary).toBe("lunch");
   });
 
-  it("uses a valid model plan only after deterministic unsupported intent and confirms an update", async () => {
+  it("executes a clear private model update without confirmation", async () => {
     const gateway = new FakeCalendarGateway([event()]);
+    const planner = new FakeCommandPlanner({
+      kind: "update",
+      newStartTime: "16:00",
+      selector: { date: "2025-01-10", summary: "meeting", time: "15:00" },
+    });
+    const assistant = createAssistant(gateway, undefined, planner);
+    const request = message("Could you shift the 3pm meeting on Friday to 4pm?");
+
+    await assistant.handle(withGeminiResponseAttribution(request, true));
+
+    expect(planner.calls).toEqual([{
+      now,
+      text: request.content,
+      timeZone,
+    }]);
+    expect(gateway.updateCalls).toHaveLength(1);
+    expect(gateway.updateCalls[0]?.eventId).toBe("meeting-1");
+    expect(request.replies.join(" ")).toMatch(/moved/i);
+    expect(request.replies.join(" ")).toMatch(/\[Gemini\]$/u);
+    expect(request.replies.join(" ")).not.toMatch(/confirm|review/i);
+  });
+
+  it("requires confirmation before a model-proposed update that affects guests", async () => {
+    const gateway = new FakeCalendarGateway([
+      event({ attendees: [{ email: "guest@example.com", self: false }] }),
+    ]);
     const planner = new FakeCommandPlanner({
       kind: "update",
       newStartTime: "16:00",
@@ -552,17 +580,15 @@ describe("CalendarAssistant Gemini fallback", () => {
 
     await assistant.handle(request);
 
-    expect(planner.calls).toEqual([{
-      now,
-      text: request.content,
-      timeZone,
-    }]);
     expect(gateway.updateCalls).toHaveLength(0);
-    expect(request.replies.join(" ")).toMatch(/model proposed/i);
+    expect(request.replies.join(" ")).toMatch(/guests will receive/i);
 
-    await assistant.handle(message(`confirm ${actionId(request.replies.join(" "))}`));
+    const id = actionId(request.replies.join(" "));
+    const confirmation = message(`confirm ${id}`);
+    await assistant.handlePendingAction(withGeminiResponseAttribution(confirmation, true), { actionId: id, kind: "confirm" });
     expect(gateway.updateCalls).toHaveLength(1);
-    expect(gateway.updateCalls[0]?.eventId).toBe("meeting-1");
+    expect(gateway.updateCalls[0]?.sendUpdates).toBe("all");
+    expect(confirmation.replies.join(" ")).toMatch(/Moved.*\[Gemini\]$/u);
   });
 
   it("preserves the deterministic clarification and makes no write when the planner is unavailable", async () => {
@@ -583,7 +609,7 @@ describe("CalendarAssistant Gemini fallback", () => {
     expect(request.replies).toEqual(["I couldn't determine a calendar command."]);
   });
 
-  it("requires confirmation before a model-proposed create", async () => {
+  it("executes a clear private model create without confirmation", async () => {
     const gateway = new FakeCalendarGateway([]);
     const planner = new FakeCommandPlanner({
       kind: "create",
@@ -596,11 +622,11 @@ describe("CalendarAssistant Gemini fallback", () => {
     const request = message("Please put planning on my calendar Friday at 3pm");
 
     await assistant.handle(request);
-    expect(gateway.createCalls).toHaveLength(0);
 
-    await assistant.handle(message(`confirm ${actionId(request.replies.join(" "))}`));
     expect(gateway.createCalls).toHaveLength(1);
     expect(gateway.createCalls[0]?.summary).toBe("Planning");
+    expect(request.replies.join(" ")).toMatch(/created/i);
+    expect(request.replies.join(" ")).not.toMatch(/confirm|review/i);
   });
 
   it("requires confirmation before model-proposed delete and reminder writes", async () => {
@@ -730,5 +756,21 @@ describe("CalendarAssistant recurring conflict freshness", () => {
 
     expect(gateway.updateCalls).toHaveLength(0);
     expect(confirmation.replies.join(" ")).toMatch(/overlaps another event/i);
+  });
+});
+
+
+describe("CalendarAssistant Discord timestamps", () => {
+  it("renders Calendar list dates and event starts with Discord timestamps", async () => {
+    const gateway = new FakeCalendarGateway([event()]);
+    const assistant = createAssistant(gateway);
+    const input = message("what do I have Friday?");
+
+    await assistant.handle(input);
+
+    const reply = input.replies.join(" ");
+    expect(reply).toMatch(/Schedule for <t:\d+:D>:/u);
+    expect(reply).toMatch(/Team meeting \(<t:\d+:F>\)/u);
+    expect(reply).not.toContain("2025-01-10");
   });
 });

@@ -12,10 +12,14 @@ import { GoogleOAuthCallbackHandler } from "./google/oauth-callback.js";
 import { GoogleApiOAuthProvider, GoogleOAuthService } from "./google/oauth-service.js";
 import { startHealthServer, type HealthServer } from "./http/health-server.js";
 import { createLogger } from "./logger.js";
-import { GeminiStructuredCommandPlanner } from "./nlp/gemini-structured-planner.js";
+import { GeminiActionPlanner } from "./nlp/gemini-action-planner.js";
 import { AppStateRepository } from "./persistence/state-repository.js";
 import { ReminderScheduler } from "./reminders/reminder-scheduler.js";
-import { GeminiStructuredTaskPlanner } from "./tasks/gemini-structured-task-planner.js";
+import { AgendaService } from "./scheduling/agenda-service.js";
+import { DailyAgendaScheduler } from "./scheduling/daily-agenda-scheduler.js";
+import { ScheduleAssistant } from "./scheduling/schedule-assistant.js";
+import { ScheduledReminderScheduler } from "./scheduling/scheduled-reminder-scheduler.js";
+import { SchedulingRepository } from "./scheduling/scheduling-repository.js";
 import { LocalTaskAssistant } from "./tasks/local-task-assistant.js";
 import { LocalTaskReminderScheduler } from "./tasks/local-task-reminder-scheduler.js";
 
@@ -26,10 +30,21 @@ async function main(): Promise<void> {
   const googleIntegration = getGoogleCalendarConfig(config);
   const geminiFallback = getGeminiFallbackConfig(config);
 
+  logger.info({
+    geminiApiKeyConfigured: Boolean(config.GEMINI_API_KEY),
+    geminiModel: config.GEMINI_MODEL ?? null,
+    geminiNaturalLanguageEnabled: config.GEMINI_NATURAL_LANGUAGE_ENABLED,
+    geminiPlannerConfigured: Boolean(geminiFallback),
+    geminiResponseLabelEnabled: config.GEMINI_RESPONSE_LABEL_ENABLED,
+  }, "Gemini natural-language planner configuration");
+
   let stateRepository: AppStateRepository | undefined;
+  let schedulingRepository: SchedulingRepository | undefined;
   let discordBot: DiscordBot | undefined;
   let reminderScheduler: ReminderScheduler | undefined;
   let localTaskReminderScheduler: LocalTaskReminderScheduler | undefined;
+  let scheduledReminderScheduler: ScheduledReminderScheduler | undefined;
+  let dailyAgendaScheduler: DailyAgendaScheduler | undefined;
   let healthServer: HealthServer | undefined;
 
   try {
@@ -40,15 +55,19 @@ async function main(): Promise<void> {
         databasePath: config.DATABASE_PATH,
         encryptionSecret: localIntegration.encryptionKey,
       });
+      schedulingRepository = new SchedulingRepository({
+        databasePath: config.DATABASE_PATH,
+        encryptionSecret: localIntegration.encryptionKey,
+      });
 
-      const taskCommandPlanner = geminiFallback
-        ? new GeminiStructuredTaskPlanner({
+      const naturalLanguagePlanner = geminiFallback
+        ? new GeminiActionPlanner({
           apiKey: geminiFallback.apiKey,
+          logger,
           model: geminiFallback.model,
         })
         : undefined;
       const localTaskAssistant = new LocalTaskAssistant({
-        ...(taskCommandPlanner ? { commandPlanner: taskCommandPlanner } : {}),
         logger,
         ownerId: localIntegration.discordOwnerId,
         stateRepository,
@@ -73,27 +92,40 @@ async function main(): Promise<void> {
           redirectUri: googleIntegration.googleRedirectUri,
           stateRepository,
         });
-        const calendarCommandPlanner = geminiFallback
-          ? new GeminiStructuredCommandPlanner({
-            apiKey: geminiFallback.apiKey,
-            model: geminiFallback.model,
-          })
-          : undefined;
         calendarAssistant = new CalendarAssistant({
           calendarGateway,
-          ...(calendarCommandPlanner ? { commandPlanner: calendarCommandPlanner } : {}),
           logger,
           ownerId: localIntegration.discordOwnerId,
           stateRepository,
         });
       }
 
+      const scheduleAssistant = new ScheduleAssistant({
+        ...(calendarGateway ? { calendarGateway } : {}),
+        geminiEnabled: Boolean(geminiFallback),
+        legacyTaskReader: stateRepository,
+        logger,
+        ownerId: localIntegration.discordOwnerId,
+        schedulingRepository,
+        stateRepository,
+        timeZone: localIntegration.taskTimeZone,
+      });
+      const agendaService = new AgendaService({
+        ...(calendarGateway ? { calendarGateway } : {}),
+        legacyTaskReader: stateRepository,
+        ownerId: localIntegration.discordOwnerId,
+        schedulingRepository,
+        timeZone: localIntegration.taskTimeZone,
+      });
       const commandRouter = new OwnerCommandRouter({
         ...(calendarAssistant ? { calendarAssistant } : {}),
         ...(calendarGateway ? { calendarReader: calendarGateway } : {}),
         ...(oauthService ? { oauthService } : {}),
+        ...(naturalLanguagePlanner ? { naturalLanguagePlanner } : {}),
+        geminiResponseLabelEnabled: config.GEMINI_RESPONSE_LABEL_ENABLED,
         localTaskAssistant,
         ownerId: localIntegration.discordOwnerId,
+        scheduleAssistant,
         stateRepository,
         taskTimeZone: localIntegration.taskTimeZone,
       });
@@ -112,6 +144,28 @@ async function main(): Promise<void> {
         },
         stateRepository,
       });
+      scheduledReminderScheduler = new ScheduledReminderScheduler({
+        logger,
+        ownerId: localIntegration.discordOwnerId,
+        pollIntervalMilliseconds: config.REMINDER_POLL_INTERVAL_SECONDS * 1_000,
+        sendOwnerMessage: async (content) => {
+          await discordBot?.sendOwnerMessage(content);
+        },
+        stateRepository: schedulingRepository,
+      });
+      if (config.DAILY_AGENDA_ENABLED) {
+        dailyAgendaScheduler = new DailyAgendaScheduler({
+          agendaService,
+          logger,
+          ownerId: localIntegration.discordOwnerId,
+          pollIntervalMilliseconds: config.REMINDER_POLL_INTERVAL_SECONDS * 1_000,
+          sendOwnerMessage: async (content) => {
+            await discordBot?.sendOwnerMessage(content);
+          },
+          stateRepository: schedulingRepository,
+          timeZone: localIntegration.taskTimeZone,
+        });
+      }
 
       if (calendarGateway) {
         reminderScheduler = new ReminderScheduler({
@@ -148,6 +202,8 @@ async function main(): Promise<void> {
     if (discordBot) {
       await discordBot.start();
       localTaskReminderScheduler?.start();
+      scheduledReminderScheduler?.start();
+      dailyAgendaScheduler?.start();
       reminderScheduler?.start();
     } else {
       logger.warn(
@@ -156,9 +212,12 @@ async function main(): Promise<void> {
     }
   } catch (error: unknown) {
     localTaskReminderScheduler?.stop();
+    scheduledReminderScheduler?.stop();
+    dailyAgendaScheduler?.stop();
     reminderScheduler?.stop();
     await discordBot?.stop();
     await healthServer?.close();
+    schedulingRepository?.close();
     stateRepository?.close();
     throw error;
   }
@@ -166,9 +225,12 @@ async function main(): Promise<void> {
   const shutdown = (signal: string): void => {
     logger.info({ signal }, "Shutting down");
     localTaskReminderScheduler?.stop();
+    scheduledReminderScheduler?.stop();
+    dailyAgendaScheduler?.stop();
     reminderScheduler?.stop();
     void Promise.all([discordBot?.stop(), healthServer?.close()])
       .then(() => {
+        schedulingRepository?.close();
         stateRepository?.close();
         logger.info("Shutdown complete");
       })

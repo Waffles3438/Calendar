@@ -1,5 +1,7 @@
 import { DateTime, IANAZone } from "luxon";
 
+import { formatDiscordTimestamp } from "../discord/discord-timestamp.js";
+
 export const DEFAULT_TASK_TIME_ZONE = "America/Toronto";
 
 export type LocalTaskDateTimeValidation =
@@ -77,5 +79,5 @@ export function localTaskDate(dueAt: Date, timeZone: string): string {
 
 /** Lets Discord render the task instant in each recipient's locale and time zone. */
 export function formatTaskDueAt(dueAt: Date, _timeZone: string): string {
-  return `<t:${Math.floor(dueAt.valueOf() / 1_000)}:F>`;
+  return formatDiscordTimestamp(dueAt);
 }

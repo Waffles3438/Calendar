@@ -7,3 +7,5 @@ data/
 !.env.example
 *.log
 npm-debug.log*
+# Generated semantic review artifacts
+semantic-review/

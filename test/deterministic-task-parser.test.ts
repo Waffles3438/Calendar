@@ -23,12 +23,24 @@ describe("parseDeterministicTaskCommand", () => {
     });
   });
 
-  it("creates a relative-minute local task without requiring a date", () => {
+  it("creates relative whole-hour and minute local tasks without requiring a date", () => {
     expect(parseDeterministicTaskCommand("remind me in 30 mins to run", context())).toEqual({
       date: "2026-08-17",
       kind: "create",
       time: "16:30",
       title: "run",
+    });
+    expect(parseDeterministicTaskCommand("remind me in 1 hr to stretch", context())).toEqual({
+      date: "2026-08-17",
+      kind: "create",
+      time: "17:00",
+      title: "stretch",
+    });
+    expect(parseDeterministicTaskCommand("remind me in 2 hrs to walk", context())).toEqual({
+      date: "2026-08-17",
+      kind: "create",
+      time: "18:00",
+      title: "walk",
     });
   });
 

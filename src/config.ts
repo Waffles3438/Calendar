@@ -10,6 +10,25 @@ const emptyStringToUndefined = (value: unknown): unknown =>
   typeof value === "string" && value.trim() === "" ? undefined : value;
 
 const optionalString = z.preprocess(emptyStringToUndefined, z.string().trim().min(1).optional());
+const booleanFlag = (defaultValue: boolean) => z.preprocess(
+  (value: unknown) => {
+    if (typeof value !== "string") {
+      return value;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "") {
+      return undefined;
+    }
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
+    return value;
+  },
+  z.boolean().default(defaultValue),
+);
 const geminiModel = z.preprocess(
   emptyStringToUndefined,
   z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/u).optional(),
@@ -56,6 +75,9 @@ const configSchema = z
     ENCRYPTION_KEY: z.preprocess(emptyStringToUndefined, z.string().min(32).optional()),
     GEMINI_API_KEY: optionalString,
     GEMINI_MODEL: geminiModel,
+    GEMINI_NATURAL_LANGUAGE_ENABLED: booleanFlag(true),
+    GEMINI_RESPONSE_LABEL_ENABLED: booleanFlag(true),
+    DAILY_AGENDA_ENABLED: booleanFlag(true),
   })
   .superRefine((value, context) => {
     if (value.DISCORD_BOT_TOKEN && !value.DISCORD_OWNER_ID) {
@@ -197,6 +219,10 @@ export function getBotIntegrationConfig(config: AppConfig): BotIntegrationConfig
 
 /** Returns no fallback when Gemini is disabled, or fails closed for partial setup. */
 export function getGeminiFallbackConfig(config: AppConfig): GeminiFallbackConfig | undefined {
+  if (!config.GEMINI_NATURAL_LANGUAGE_ENABLED) {
+    return undefined;
+  }
+
   if (!config.GEMINI_API_KEY && !config.GEMINI_MODEL) {
     return undefined;
   }

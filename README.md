@@ -1,14 +1,14 @@
 # Discord Calendar and Task Assistant
 
-A single-owner Discord DM bot for private local tasks and optional Google Calendar access. Local tasks are stored encrypted in SQLite, use a configured IANA time zone (default `America/Toronto`), and can repeat reminder DMs until completed or cancelled. Common commands use deterministic parsing; an optional Gemini fallback handles unsupported wording without receiving task rows, calendar events, OAuth credentials, Discord metadata, or execution access.
+A single-owner Discord DM bot for private local tasks and optional Google Calendar access. Local tasks are stored encrypted in SQLite, use a configured IANA time zone (default `America/Toronto`), and can repeat reminder DMs until completed or cancelled. An optional hosted Gemini natural-language layer interprets ordinary owner messages through one validated application-action contract without receiving task rows, calendar events, OAuth credentials, Discord metadata, or execution access; deterministic handlers remain the safe fallback when Gemini is unavailable.
 
 ## Operating model
 
 - **One person, direct messages only.** The bot ignores guild messages, bot messages, and DMs from everyone except `DISCORD_OWNER_ID`.
 - **Local tasks work without Google.** Configure Discord, the owner ID, and `ENCRYPTION_KEY` to use tasks even if Google is unconfigured, disconnected, or unavailable.
-- **Safe writes.** Ambiguous task matches, calendar writes with meaningful impact, and every Gemini-proposed mutation require a one-time `confirm <id>` reply. `cancel <id>` stops a pending action.
+- **Safe writes.** Ambiguous task matches, guest-impacting Calendar changes, Calendar deletes/reminders/recurrence/attendee changes, bulk task cancellation, and model proposals outside the phase-one low-risk set require a one-time `confirm <id>` reply. `cancel <id>` stops a pending action.
 - **Least-privilege Google access.** When enabled, the app requests `calendar.events` plus read-only calendar-list access; it does not use a service account.
-- **Optional hosted AI.** Gemini is disabled unless both Gemini variables are configured. Deterministic task/calendar parsing and reminders work without it.
+- **Optional hosted AI.** Gemini is used only when both Gemini variables are configured and `GEMINI_NATURAL_LANGUAGE_ENABLED` is not `false`. When a reply uses an accepted Gemini action or clarification, it ends with ` [Gemini]` by default; set `GEMINI_RESPONSE_LABEL_ENABLED=false` to hide that disclosure without disabling Gemini. Deterministic task/calendar parsing and reminders work without it.
 
 ## Local tasks
 
@@ -23,12 +23,26 @@ Use local task commands in an owner DM. They never create a Google Calendar even
 | `what tasks do I have today?` | Lists only active tasks due on the requested configured local date (Toronto by default). |
 | `done run` or `complete task run` | Completes one clear active match; multiple matches produce `choose <id> <number>`. |
 | `cancel task run tomorrow` or `delete task run tomorrow` | Cancels one clear local task without affecting a Google Calendar event. |
-| `delete all tasks` | Reviews all active local tasks and requires `confirm <id>` before cancelling them. |
+| `delete all tasks` | Reviews only strictly future active local tasks and requires `confirm <id>` before cancelling them; tasks due now or earlier are left unchanged. |
 | `delete all tasks for today` | Cancels one task due today immediately; reviews before cancelling multiple tasks due today. |
 
 Delete commands cancel tasks rather than erasing their encrypted history, which stops future local reminders while retaining the task lifecycle record. A task normally must include a title, a supplied date expression (`tomorrow`, a weekday, or `YYYY-MM-DD`), and a time. The exception is `remind me in <positive whole minutes> to <title>`: the bot calculates the due instant from the configured time zone and rounds up to minute precision so the reminder is never early. A time-only request such as `remind me at 6pm to run` still requires a date. Calendar wording such as `remind me 30 mins before <event>` remains a Google Calendar reminder, not a local task. The bot rejects nonexistent or ambiguous Toronto daylight-saving wall times rather than silently changing the reminder instant.
 
-A task has nine scheduled reminder slots: at its due time and every 15 minutes through two hours afterward. Before sending a slot, the scheduler takes a durable claim and records the delivery after Discord accepts it, so overlapping workers sharing one SQLite database do not send the same live slot. Delivery is at-least-once, not exactly-once: a process crash or lease expiry after Discord accepts a DM but before durable completion can retry that slot. Completing or cancelling a task stops future slots. After downtime, the scheduler sends only the newest eligible missed slot inside that original two-hour window; it never sends a burst of old reminders. Recurring tasks, snooze, rescheduling, and task editing are intentionally out of scope in this version; recurring wording receives a clear unsupported response.
+A task has nine scheduled reminder slots: at its due time and every 15 minutes through two hours afterward. Before sending a slot, the scheduler takes a durable claim and records the delivery after Discord accepts it, so overlapping workers sharing one SQLite database do not send the same live slot. Delivery is at-least-once, not exactly-once: a process crash or lease expiry after Discord accepts a DM but before durable completion can retry that slot. Completing or cancelling a task stops future slots. After downtime, the scheduler sends only the newest eligible missed slot inside that original two-hour window; it never sends a burst of old reminders. Legacy local-task commands remain one-time timed reminders; recurring, all-day, and conversational scheduling are provided by the unified scheduler below.
+
+## Conversational scheduling and unified agenda
+
+The scheduler understands direct owner-DM requests before the legacy task and Calendar handlers when the wording unambiguously belongs to the new scheduling grammar. It does not replace existing commands such as `remind me in 30 mins to run`, `remind me 30 minutes before <event>`, `done <legacy title>`, or Calendar move/delete commands.
+
+- **Agenda:** `What do i need to do today`, `What needs to get done today?`, `What do i need to do this week`, and `What does Monday look like?` show unified results grouped and ordered as **Tasks**, **Events**, then **Reminders**. The agenda includes all-day scheduled tasks, timed scheduled reminders, legacy local timed tasks, and all readable Google calendars. Calendar list/event reads are paginated. A Calendar read failure fails the agenda request rather than silently reporting an incomplete agenda.
+- **Task, reminder, and event rules:** A task is all-day and has no start/end time. A reminder requires a start time. An event requires a start and end time or a start and duration; a start-only event request becomes a reminder, and `remind` wording without a start becomes an all-day task. One date means one occurrence; a date plus recurrence creates a series; recurrence without an anchor asks for a date. `hr`/`hrs`, `d`, `w`, `m`, `y`, `min`, and `mins` are accepted numeric temporal shortcuts (`m` means month outside the explicit `duration: 60m` correction field).
+- **Recurrence:** `daily`, `weekly`, `bi-weekly` / `every other <weekday>`, `monthly`, and `yearly` are supported. Bi-weekly means every two weeks. Monthly/yearly recurrence requires a concrete ISO date. Local recurring occurrences are independently materialized and remain rolling for reminder delivery; cancelling a matched recurring local schedule cancels all future occurrences.
+- **Google events:** An unnamed event uses the writable primary calendar, falling back only when no writable primary exists. Use `in Team calendar` to name another calendar; matching is case-insensitive but must produce exactly one writable calendar. Event timing is checked against that calendar's time zone, including DST gaps/repeated wall times. Duration may cross midnight. New event creates warn about a detected same-calendar overlap.
+- **Reviewed cleanup:** `My yoga classes ended`, explicit plural/future cleanup wording such as `delete all future yoga classes`, and unscoped bulk cleanup such as `delete all tasks`, `delete all reminders`, `delete all events`, or `delete all tasks/events/reminders` gather only future targets. Timed records must start or be due after the current instant; all-day records must start on a later local date. The bot shows a review and requires `confirm <id>`; `cancel <id>` stops it. Date-scoped cleanup such as `delete all events for today` intentionally includes matching records on that date, including current or past records, and retains the usual review safeguards. Calendar targets and recurring series masters are re-read with ETags before any write, and guest notifications are disclosed and sent only when needed.
+- **Daily delivery:** By default, the owner receives one unified agenda after **7:00 AM** in `LOCAL_TASK_TIME_ZONE` every local date. Startup after 7 AM catches up once for that date. Delivery uses a durable lease/record and is at-least-once: a crash after Discord accepts a DM but before the record commits can cause one retry. Set `DAILY_AGENDA_ENABLED=false` to disable this delivery.
+- **Gemini/manual fallback and local learning:** Ordinary owner messages first use the single tool-free Gemini action planner when enabled. It returns one strictly validated application action or asks for clarification; the router dispatches that typed action through the same mutation policy, ETag checks, confirmations, persistence, and audit paths as deterministic commands. If Gemini is unavailable, returns malformed/incomplete output, or proposes an unsafe action, the request falls back safely to deterministic parsing or a clarification. Clarification context is encrypted, owner-bound, and retained for ten minutes so a short follow-up can complete the request after a process restart.
+
+For a new scheduled reminder, the first delivery is 30 minutes before its start, then at the start and every 15 minutes through two hours afterward. Each message includes a stable `done <id>` command that completes that new scheduled occurrence and stops its remaining reminder slots.
 
 ## Requirements
 
@@ -75,7 +89,7 @@ A task has nine scheduled reminder slots: at its due time and every 15 minutes t
 
 ## Configuration
 
-Empty values are treated as unset. The bot starts in health-only mode when no local bot values are set. To enable Discord and local tasks, configure **all three** local values: `DISCORD_BOT_TOKEN`, `DISCORD_OWNER_ID`, and `ENCRYPTION_KEY`. Google Calendar remains optional and requires all three Google settings together. Gemini remains optional and requires both Gemini settings together.
+Empty values are treated as unset. The bot starts in health-only mode when no local bot values are set. To enable Discord and local tasks, configure **all three** local values: `DISCORD_BOT_TOKEN`, `DISCORD_OWNER_ID`, and `ENCRYPTION_KEY`. Google Calendar remains optional and requires all three Google settings together. Gemini remains optional, requires both provider settings together, and can be disabled during rollout with `GEMINI_NATURAL_LANGUAGE_ENABLED=false`.
 
 | Variable | Default | Purpose |
 |---|---:|---|
@@ -85,7 +99,8 @@ Empty values are treated as unset. The bot starts in health-only mode when no lo
 | `LOG_LEVEL` | `info` | Pino level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`. |
 | `DATABASE_PATH` | `./data/calendar-bot.sqlite` | SQLite path. Use an absolute persistent path in production. |
 | `REMINDER_POLL_INTERVAL_SECONDS` | `60` | Reminder poll interval, 15–300 seconds. |
-| `LOCAL_TASK_TIME_ZONE` | `America/Toronto` | IANA zone used for local task parsing, storage display, and DST checks. |
+| `DAILY_AGENDA_ENABLED` | `true` | Send one unified owner agenda after 7:00 AM in `LOCAL_TASK_TIME_ZONE`; set `false` to disable it. |
+| `LOCAL_TASK_TIME_ZONE` | `America/Toronto` | IANA zone used for local task parsing, storage display, daily agenda delivery, and DST checks. |
 | `DISCORD_BOT_TOKEN` | — | Discord bot token; required for the local Discord/task runtime. |
 | `DISCORD_OWNER_ID` | — | The sole permitted Discord user ID (17–20 digits). |
 | `ENCRYPTION_KEY` | — | Secret of at least 32 characters used to encrypt OAuth credentials, pending actions, and local task titles. |
@@ -94,6 +109,8 @@ Empty values are treated as unset. The bot starts in health-only mode when no lo
 | `GOOGLE_REDIRECT_URI` | — | Optional exact public callback URL, normally `https://calendar.example.com/oauth/google/callback`. |
 | `GEMINI_API_KEY` | — | Optional Gemini API key; requires `GEMINI_MODEL`. |
 | `GEMINI_MODEL` | — | Optional Gemini model identifier; requires `GEMINI_API_KEY`. |
+| `GEMINI_NATURAL_LANGUAGE_ENABLED` | `true` | Rollout kill switch for the hosted natural-language action planner. Set `false` to leave Gemini configured but unused. |
+| `GEMINI_RESPONSE_LABEL_ENABLED` | `true` | Append ` [Gemini]` to replies that use an accepted Gemini action or clarification. Set `false` to hide the disclosure without disabling Gemini. |
 
 A local-task-only installation needs the three local values. Google Calendar features start only when all Google values are present; `/status` reports Google as unconfigured otherwise, and `/connect` / `/disconnect` explain that availability. The local task timezone must be a valid IANA timezone. `America/Toronto` observes DST, so date parsing and display follow Toronto’s current offset.
 
@@ -129,28 +146,37 @@ The OAuth URL requests offline access and explicit consent so a refresh token ca
 
 Use the official [OAuth web-server guide](https://developers.google.com/identity/protocols/oauth2/web-server) and [Calendar authorization-scope reference](https://developers.google.com/workspace/calendar/api/auth) when configuring the Cloud project.
 
-## Optional Gemini fallback
+## Optional Gemini natural-language layer
 
-Leave both `GEMINI_API_KEY` and `GEMINI_MODEL` empty to run without hosted AI. When enabled, Gemini is called only after deterministic parsing reports an **unsupported** task-shaped or calendar request. A recognized command missing a title, date, or time is never sent to Gemini; the bot asks for that missing detail instead. Failed, incomplete, malformed, or unsafe model output falls back safely without a write.
+Leave both `GEMINI_API_KEY` and `GEMINI_MODEL` empty to run without hosted AI. When both are configured and `GEMINI_NATURAL_LANGUAGE_ENABLED` is not `false`, ordinary owner messages go through one fail-closed Gemini action planner. The planner returns one strictly validated Calendar, task, reminder, agenda, cleanup, or clarification action; it does not select an execution handler or access application state. Control commands (`confirm`, `cancel`, `choose`, `connect`, `disconnect`, `status`, and `done <UUID>`) remain direct and are handled before Gemini. If the planner is unavailable or returns no safe action, the router falls back to deterministic handlers without invoking a second hosted interpretation path.
+
+Phase-one model execution is deliberately narrow:
+
+- Clear Calendar creates and private, non-recurring Calendar moves execute without an extra confirmation.
+- Clear one-time local-task creates, completions, and cancellations execute without an extra confirmation.
+- Calendar actions that affect guests, deletes, reminders, recurrence, attendee changes, ambiguous matches, and unsupported or incomplete requests still require clarification or confirmation.
+- The model never receives event/task rows, IDs, ETags, OAuth data, Discord metadata, or tools; it returns only a locally validated command proposal.
 
 ### Enable Gemini
 
 1. Create an API key in your Gemini/Google AI account. Keep the key private; never commit, log, or paste it into chat or a support request.
-2. In your private environment file, set **both** values together:
+2. In your private environment file, set both provider values together. The rollout flag defaults to `true`; set it to `false` to disable the natural-language layer without removing the provider settings. `GEMINI_RESPONSE_LABEL_ENABLED` also defaults to `true`; set it to `false` to keep Gemini enabled while hiding the ` [Gemini]` suffix that discloses accepted actions or clarifications:
 
    ```ini
    GEMINI_API_KEY=your-private-api-key
    GEMINI_MODEL=your-supported-model-id
+   GEMINI_NATURAL_LANGUAGE_ENABLED=true
+   GEMINI_RESPONSE_LABEL_ENABLED=true
    ```
 
-   `GEMINI_API_KEY` is the secret credential used to authenticate requests. `GEMINI_MODEL` is the non-secret, bare identifier of the Gemini model that should handle fallback parsing—it is **not** another API key. Copy a supported model identifier from your Gemini account; this application accepts only letters, numbers, `.`, `_`, and `-`, so do not use a URL or a `models/` prefix.
+   `GEMINI_API_KEY` is the secret credential used to authenticate requests. `GEMINI_MODEL` is the non-secret, bare identifier of the Gemini model that should handle natural-language parsing—it is **not** another API key. Copy a supported model identifier from your Gemini account; this application accepts only letters, numbers, `.`, `_`, and `-`, so do not use a URL or a `models/` prefix.
 3. Restart the bot after changing its environment. The application rejects a partial Gemini setup: both values must be set, or both must be blank.
 
 ### Verify and troubleshoot Gemini safely
 
-Use a benign, complete, unsupported task-shaped request through the owner DM path to exercise the fallback; do not use personal task content or paste credentials into a command. A model-proposed mutation must be reviewed with `confirm <id>`; cancel the pending action instead of confirming it when testing only. If a generic structured-output smoke test or fallback yields no proposal, verify that both variables are present, the selected model supports Gemini Interactions structured JSON output, and the account has current provider availability and quota. Invalid, malformed, incomplete, or unsafe provider output is intentionally discarded without a write or a raw provider response in logs. See Google's [Interactions structured-output guide](https://ai.google.dev/gemini-api/docs/interactions/structured-output) for compatible request behavior.
+Use a benign, complete natural-language request through the owner DM path to exercise the unified action planner; do not use personal task content or paste credentials into a command. To validate the no-write path before rollout, run `npm test -- test/natural-language-evaluator.test.ts test/natural-language-dry-run.test.ts`. In production, a clear phase-one private move/create or one-time task transition may execute directly; guest-impacting Calendar actions and all other guarded operations return a review prompt with `confirm <id>`. If you want to disable hosted AI immediately, set `GEMINI_NATURAL_LANGUAGE_ENABLED=false` and restart the process. If a structured-output smoke test yields no proposal, verify that both provider variables are present, the selected model supports Gemini Interactions structured JSON output, and the account has current provider availability and quota. Invalid, malformed, incomplete, or unsafe provider output is intentionally discarded without a write or a raw provider response in logs. See Google's [Interactions structured-output guide](https://ai.google.dev/gemini-api/docs/interactions/structured-output) for compatible request behavior.
 
-The calendar and local-task planners receive only the owner’s unsupported request text, current time, and the relevant IANA time zone. The task planner always uses `LOCAL_TASK_TIME_ZONE`; it does not receive task rows, task IDs, task history, calendar events, OAuth data, Discord metadata, database data, or tool access. Requests are storage-disabled where the Gemini SDK supports it, returned JSON is strictly validated locally, and every model-proposed local-task create/complete/cancel or Calendar mutation requires `confirm <id>`. Read-only task listing may execute directly.
+The unified action planner receives only the owner’s request text, current time, optional short-lived clarification context, and the relevant IANA time zone. It never receives task rows, task IDs, task history, calendar events, event IDs, ETags, OAuth data, Discord metadata, database data, or tool access. It returns one schema-validated application action; the router and assistants remain authoritative for policy, matching, confirmations, ETags, writes, and audits. Requests are storage-disabled where the Gemini SDK supports it. Clear phase-one private Calendar creates/moves and one-time local-task creates/completions/cancellations may execute directly; guest-impacting Calendar actions, deletes, reminders, recurrence, attendee changes, ambiguity, bulk task deletion, and unsupported capabilities remain guarded.
 
 The Gemini key is never printed, logged, or written to repository files. Free-tier availability, quotas, supported models, regions, and pricing are provider-account dependent and can change. Do not assume a particular model remains free. Choose a compatible model identifier from your Google AI account and plan for quota failures to safely fall back to deterministic behavior. See Google’s [API-key guide](https://ai.google.dev/gemini-api/docs/api-key), [rate-limit reference](https://ai.google.dev/gemini-api/docs/rate-limits), and [pricing page](https://ai.google.dev/gemini-api/docs/pricing).
 
@@ -206,6 +232,7 @@ PORT=3000
 DATABASE_PATH=/var/lib/discord-calendar-assistant/calendar-bot.sqlite
 LOG_LEVEL=info
 REMINDER_POLL_INTERVAL_SECONDS=60
+DAILY_AGENDA_ENABLED=true
 LOCAL_TASK_TIME_ZONE=America/Toronto
 DISCORD_BOT_TOKEN=replace-me
 DISCORD_OWNER_ID=123456789012345678
@@ -214,9 +241,11 @@ ENCRYPTION_KEY=replace-with-a-durable-random-secret
 # GOOGLE_CLIENT_ID=replace-me.apps.googleusercontent.com
 # GOOGLE_CLIENT_SECRET=replace-me
 # GOOGLE_REDIRECT_URI=https://calendar.example.com/oauth/google/callback
-# Optional Gemini fallback: include both or neither.
+# Optional Gemini natural-language layer: include both provider values or neither.
 # GEMINI_API_KEY=replace-me
 # GEMINI_MODEL=replace-with-a-supported-model-id
+# GEMINI_NATURAL_LANGUAGE_ENABLED=true
+# GEMINI_RESPONSE_LABEL_ENABLED=true
 ```
 
 ```sh
@@ -263,8 +292,8 @@ If Node is not `/usr/bin/node`, update `ExecStart` in the installed unit. Keep o
 | `redirect_uri_mismatch` from Google | Ensure the Console URI and `GOOGLE_REDIRECT_URI` match exactly and the reverse proxy forwards `/oauth/google/callback`. |
 | Google link succeeds but no usable connection | Re-run `/connect` and approve consent so Google returns or preserves a refresh token. |
 | Bot does not respond | DM it from the configured owner account, verify the bot token and owner ID, and check Discord DM/privacy permissions. Guild messages are intentionally ignored. |
-| Gemini is never used | Configure both Gemini variables, use an unsupported task-shaped/calendar request with all required details, and check provider quota/model availability. |
-| A model-proposed task is not applied | Read the review prompt and reply `confirm <id>` before it expires. Deterministic canonical task commands do not need this confirmation. |
+| Gemini is never used | Configure both Gemini variables, leave `GEMINI_NATURAL_LANGUAGE_ENABLED=true`, use a complete natural-language request, and check provider quota/model availability. |
+| A natural-language action is not applied | Check whether the request was ambiguous/incomplete, affects Calendar guests, is a delete/reminder/recurrence/attendee action, or was disabled by `GEMINI_NATURAL_LANGUAGE_ENABLED=false`; guarded operations intentionally ask for clarification or `confirm <id>`. |
 | Reminders duplicate | Use one service instance with one shared SQLite database. Claims prevent an overlapping live-slot send, but a process crash or lease expiry after Discord accepts a DM and before durable completion can retry that slot; delivery is at-least-once. |
 | Reminders do not arrive | Check Discord DM availability, local task lifecycle status, service logs, the configured poll interval, and—only for calendar reminders—Google authorization. |
 
@@ -277,6 +306,14 @@ npm test
 npm run check
 npm run build
 ```
+
+The hosted-model boundary can be checked without provider calls or writes:
+
+```sh
+npm test -- test/natural-language-evaluator.test.ts test/natural-language-dry-run.test.ts
+```
+
+The evaluator sends the held-out examples under `NATURAL_LANGUAGE_EVALUATION_EXAMPLES` through the unified action-planner seam, and the release target is at least 95% correct. The dry-run suite exercises the model boundary and typed create/move/complete/cancel paths while asserting that Calendar APIs, local-task state, pending actions, and audits are not written.
 
 ## External references
 

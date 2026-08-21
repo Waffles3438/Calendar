@@ -97,3 +97,20 @@ describe("GeminiStructuredTaskPlanner", () => {
     }
   });
 });
+
+
+describe("GeminiStructuredTaskPlanner clarification output", () => {
+  it("maps a constrained clarify response to a local clarification", async () => {
+    const client = new FakeGeminiClient();
+    client.response = {
+      output_text: JSON.stringify({ kind: "clarify", reason: "unsupported_intent" }),
+    };
+
+    await expect(planner(client).plan(input)).resolves.toEqual({
+      kind: "clarify",
+      message: "I could not determine a supported one-time task command.",
+      reason: "unsupported_intent",
+    });
+    expect(String(client.calls[0]?.request.system_instruction)).toContain("Mark pay hydro as done");
+  });
+});

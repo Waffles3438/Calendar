@@ -127,3 +127,20 @@ describe("GeminiStructuredCommandPlanner", () => {
     expect(tooLong.calls).toHaveLength(0);
   });
 });
+
+
+describe("GeminiStructuredCommandPlanner clarification output", () => {
+  it("maps a constrained clarify response to a local clarification", async () => {
+    const client = new FakeGeminiClient();
+    client.response = {
+      output_text: JSON.stringify({ kind: "clarify", reason: "missing_required_detail" }),
+    };
+
+    await expect(planner(client).plan(input)).resolves.toEqual({
+      kind: "clarify",
+      message: "Please provide the missing calendar date, time, or title.",
+      reason: "missing_required_detail",
+    });
+    expect(String(client.calls[0]?.request.system_instruction)).toContain("Block 45 minutes");
+  });
+});

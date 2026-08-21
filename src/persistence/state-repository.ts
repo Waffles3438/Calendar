@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
+import { MAX_NATURAL_LANGUAGE_ACTION_CONTEXT_CHARACTERS, MAX_NATURAL_LANGUAGE_ACTION_CONTEXT_MESSAGES, type NaturalLanguageConversationContext } from "../nlp/natural-language-action.js";
+import { isNaturalLanguageClarificationReason } from "../nlp/natural-language-types.js";
 import { MAX_REMINDER_MINUTES } from "../reminders/reminder-limits.js";
 import {
   MAX_BULK_LOCAL_TASK_CANCELLATIONS,
@@ -134,6 +136,17 @@ export interface AuditRecordInput {
   readonly status: "failed" | "succeeded";
 }
 
+export interface SaveNaturalLanguageContextInput extends NaturalLanguageConversationContext {
+  readonly expiresAt: Date;
+  readonly now: Date;
+  readonly ownerId: string;
+}
+
+export interface NaturalLanguageContextRecord extends NaturalLanguageConversationContext {
+  readonly createdAt: Date;
+  readonly expiresAt: Date;
+}
+
 interface PendingActionRow {
   readonly created_at: string;
   readonly encrypted_payload: string;
@@ -174,6 +187,39 @@ function assertNonEmpty(value: string, name: string): void {
   if (!value.trim()) {
     throw new Error(`${name} must not be empty`);
   }
+}
+
+const naturalLanguageContextSchema = z.object({
+  clarificationQuestion: z.string().trim().min(1).max(800),
+  originalRequest: z.string().trim().min(1).max(1_200),
+  reason: z.string().refine(isNaturalLanguageClarificationReason, "invalid clarification reason"),
+  recentMessages: z.array(z.string().trim().min(1).max(1_200)).max(MAX_NATURAL_LANGUAGE_ACTION_CONTEXT_MESSAGES),
+}).strict();
+
+function normalizedNaturalLanguageContext(input: SaveNaturalLanguageContextInput): NaturalLanguageConversationContext {
+  assertNonEmpty(input.ownerId, "ownerId");
+  assertNonEmpty(input.originalRequest, "originalRequest");
+  assertNonEmpty(input.clarificationQuestion, "clarificationQuestion");
+  if (!Number.isInteger(input.recentMessages.length) || input.recentMessages.length > MAX_NATURAL_LANGUAGE_ACTION_CONTEXT_MESSAGES) {
+    throw new Error("recentMessages exceeds the natural-language context limit");
+  }
+  const parsed = naturalLanguageContextSchema.parse({
+    clarificationQuestion: input.clarificationQuestion,
+    originalRequest: input.originalRequest,
+    reason: input.reason,
+    recentMessages: input.recentMessages,
+  });
+  const serialized = JSON.stringify(parsed);
+  if (serialized.length > MAX_NATURAL_LANGUAGE_ACTION_CONTEXT_CHARACTERS) {
+    throw new Error("natural-language context exceeds the storage limit");
+  }
+  if (!isNaturalLanguageClarificationReason(parsed.reason)) {
+    throw new Error("reason must be a valid clarification reason");
+  }
+  return {
+    ...parsed,
+    reason: parsed.reason,
+  };
 }
 
 function occurrenceStartValue(key: ReminderOverrideKey): string {
@@ -406,6 +452,67 @@ export class AppStateRepository {
     });
 
     return consume();
+  }
+
+  /** Stores the minimum owner-bound context needed to resolve a clarification follow-up. */
+  public saveNaturalLanguageContext(input: SaveNaturalLanguageContextInput): void {
+    assertValidDate(input.now, "now");
+    assertValidDate(input.expiresAt, "expiresAt");
+    if (input.expiresAt <= input.now) {
+      throw new Error("expiresAt must be after now");
+    }
+    const context = normalizedNaturalLanguageContext(input);
+    this.store.connection.prepare(
+      `INSERT INTO natural_language_context (owner_id, encrypted_payload, expires_at, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(owner_id) DO UPDATE SET encrypted_payload = excluded.encrypted_payload,
+         expires_at = excluded.expires_at, created_at = excluded.created_at`,
+    ).run(
+      input.ownerId,
+      this.secretBox.encrypt(JSON.stringify(context)),
+      input.expiresAt.toISOString(),
+      input.now.toISOString(),
+    );
+  }
+
+  /** Reads unexpired clarification context and removes expired or corrupt records. */
+  public getNaturalLanguageContext(input: { now: Date; ownerId: string }): NaturalLanguageContextRecord | undefined {
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertValidDate(input.now, "now");
+    const row = this.store.connection.prepare(
+      `SELECT encrypted_payload, expires_at, created_at
+       FROM natural_language_context WHERE owner_id = ?`,
+    ).get(input.ownerId) as { encrypted_payload: string; expires_at: string; created_at: string } | undefined;
+    if (!row) {
+      return undefined;
+    }
+    const expiresAt = new Date(row.expires_at);
+    const createdAt = new Date(row.created_at);
+    if (Number.isNaN(expiresAt.valueOf()) || Number.isNaN(createdAt.valueOf()) || expiresAt <= input.now) {
+      this.clearNaturalLanguageContext({ ownerId: input.ownerId });
+      return undefined;
+    }
+    try {
+      const parsed = naturalLanguageContextSchema.safeParse(JSON.parse(this.secretBox.decrypt(row.encrypted_payload)));
+      if (!parsed.success || !isNaturalLanguageClarificationReason(parsed.data.reason)) {
+        this.clearNaturalLanguageContext({ ownerId: input.ownerId });
+        return undefined;
+      }
+      return {
+        ...parsed.data,
+        createdAt,
+        expiresAt,
+        reason: parsed.data.reason,
+      };
+    } catch {
+      this.clearNaturalLanguageContext({ ownerId: input.ownerId });
+      return undefined;
+    }
+  }
+
+  public clearNaturalLanguageContext(input: { ownerId: string }): void {
+    assertNonEmpty(input.ownerId, "ownerId");
+    this.store.connection.prepare("DELETE FROM natural_language_context WHERE owner_id = ?").run(input.ownerId);
   }
 
   public createLocalTask(input: CreateLocalTaskInput): LocalTask {

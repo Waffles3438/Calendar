@@ -1,5 +1,6 @@
 import { DateTime } from "luxon";
 
+import { formatDiscordDate, formatDiscordTimestamp } from "../discord/discord-timestamp.js";
 import type { CalendarEvent, CalendarEventDateTime, TimedEventDateTime } from "../domain/calendar.js";
 
 export class CalendarTimeError extends Error {
@@ -98,10 +99,10 @@ export function eventStartForReminder(event: CalendarEvent, fallbackTimeZone: st
 
 export function formatEventStart(event: CalendarEvent, fallbackTimeZone: string): string {
   if (event.start.kind === "all_day") {
-    return calendarDateTimeToDateTime(event.start, fallbackTimeZone).toFormat("ccc, LLL d (all day)");
+    return `${formatDiscordDate(event.start.date, event.start.timeZone || fallbackTimeZone)} (all day)`;
   }
 
-  return calendarDateTimeToDateTime(event.start, fallbackTimeZone).toFormat("ccc, LLL d 'at' h:mm a");
+  return formatDiscordTimestamp(calendarDateTimeToDateTime(event.start, fallbackTimeZone).toUTC().toJSDate());
 }
 
 export function eventMatchesLocalTime(

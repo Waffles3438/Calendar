@@ -32,6 +32,7 @@ export interface MutationSafetyInput {
   };
   readonly operation: CalendarOperation;
   readonly proposedByModel?: boolean;
+  readonly allowModelAutoExecution?: boolean;
   readonly recurrenceScope?: RecurrenceScope;
   readonly target?: EventSafetyTarget;
 }
@@ -79,7 +80,7 @@ export function evaluateMutationSafety(input: MutationSafetyInput): MutationSafe
 
   const reasons: SafetyReason[] = [];
 
-  if (input.proposedByModel) {
+  if (input.proposedByModel && !input.allowModelAutoExecution) {
     reasons.push("model_proposed");
   }
 

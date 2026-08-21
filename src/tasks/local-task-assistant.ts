@@ -7,7 +7,10 @@ import {
   type PendingActionMessageHandler,
   parsePendingActionInstruction,
 } from "../application/pending-action.js";
+import { markGeminiResponseUsed } from "../application/gemini-response-attribution.js";
+import { formatDiscordDate } from "../discord/discord-timestamp.js";
 import type { OwnerDirectMessage } from "../discord/owner-dm-handler.js";
+import type { NaturalLanguageAction } from "../nlp/natural-language-action.js";
 import type { PendingAction } from "../persistence/state-repository.js";
 import {
   MAX_BULK_LOCAL_TASK_CANCELLATIONS,
@@ -63,6 +66,7 @@ export interface LocalTaskStateRepository {
 
 export interface LocalTaskAssistantOptions {
   readonly commandPlanner?: TaskCommandPlanner;
+  readonly dryRun?: boolean;
   readonly logger: Logger;
   readonly now?: () => Date;
   readonly ownerId: string;
@@ -72,6 +76,7 @@ export interface LocalTaskAssistantOptions {
 }
 
 type CommandSource = "deterministic" | "gemini";
+type BulkCancellationScope = "date_scoped" | "unscoped_future";
 
 interface PendingTaskCreate {
   readonly dueAt: string;
@@ -90,8 +95,9 @@ interface PendingTaskTransition {
 }
 
 interface PendingTaskBulkCancellation {
+  readonly cleanupScope: BulkCancellationScope;
   readonly kind: "local_task_bulk_cancel";
-  readonly source: "deterministic";
+  readonly source: CommandSource;
   readonly tasks: readonly LocalTaskCancellationTarget[];
 }
 
@@ -110,6 +116,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isLocalTaskOperation(value: unknown): value is LocalTaskOperation {
   return value === "complete" || value === "cancel";
+}
+
+function isCommandSource(value: unknown): value is CommandSource {
+  return value === "deterministic" || value === "gemini";
 }
 
 function isPendingTaskCreate(value: unknown): value is PendingTaskCreate {
@@ -148,7 +158,8 @@ function isLocalTaskCancellationTarget(value: unknown): value is LocalTaskCancel
 function isPendingTaskBulkCancellation(value: unknown): value is PendingTaskBulkCancellation {
   if (!isRecord(value) ||
     value.kind !== "local_task_bulk_cancel" ||
-    value.source !== "deterministic" ||
+    !isCommandSource(value.source) ||
+    (value.cleanupScope !== "date_scoped" && value.cleanupScope !== "unscoped_future") ||
     !Array.isArray(value.tasks) ||
     value.tasks.length === 0 ||
     value.tasks.length > MAX_BULK_LOCAL_TASK_CANCELLATIONS ||
@@ -196,6 +207,57 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
   }
 
   public async handle(message: OwnerDirectMessage): Promise<void> {
+    await this.handleMessage(message, false);
+  }
+
+  public async handleNaturalLanguage(message: OwnerDirectMessage): Promise<void> {
+    await this.handleMessage(message, true);
+  }
+
+  /** Executes an already validated unified action without parsing generated text again. */
+  public async handleNaturalLanguageAction(
+    message: OwnerDirectMessage,
+    action: Extract<NaturalLanguageAction, {
+      action: "complete_task" | "create_task_or_reminder" | "delete_task" | "list_tasks";
+    }>,
+  ): Promise<void> {
+    switch (action.action) {
+      case "create_task_or_reminder":
+        if (action.scheduleKind !== "task" || !action.startTime) {
+          await message.reply("Please provide a one-time local task with a date and time.");
+          return;
+        }
+        await this.handleCommand(message, {
+          date: action.date,
+          kind: "create",
+          time: action.startTime,
+          title: action.title,
+        }, "gemini");
+        return;
+      case "list_tasks":
+        await this.handleList(message, action.date);
+        return;
+      case "complete_task":
+        await this.handleTransitionCommand(message, "complete", toLocalTaskSelector(action.selector), "gemini");
+        return;
+      case "delete_task":
+        if (action.scope === "single" && action.selector) {
+          await this.handleTransitionCommand(message, "cancel", toLocalTaskSelector(action.selector), "gemini");
+          return;
+        }
+        if (action.scope === "today" && action.date) {
+          await this.handleBulkCancellation(message, action.date, true, "gemini");
+          return;
+        }
+        await this.handleBulkCancellation(message, undefined, false, "gemini");
+        return;
+    }
+  }
+
+  private async handleMessage(
+    message: OwnerDirectMessage,
+    allowNaturalLanguageFallback: boolean,
+  ): Promise<void> {
     const pendingInstruction = parsePendingActionInstruction(message.content);
     if (pendingInstruction && await this.handlePendingAction(message, pendingInstruction)) {
       return;
@@ -207,28 +269,37 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
       timeZone: this.options.timeZone,
     });
     let source: CommandSource = "deterministic";
+    const shouldUsePlanner = this.options.commandPlanner &&
+      ((command.kind === "clarify" && command.reason === "unsupported_intent") ||
+        (allowNaturalLanguageFallback && command.kind === "not_task"));
 
-    if (command.kind === "not_task") {
+    if (command.kind === "not_task" && !allowNaturalLanguageFallback) {
       await message.reply("I couldn't determine a local task command.");
       return;
     }
 
-    if (command.kind === "clarify" &&
-      command.reason === "unsupported_intent" &&
-      this.options.commandPlanner) {
+    if (shouldUsePlanner) {
       try {
         const planned = await this.options.commandPlanner.plan({
           now,
           text: message.content,
           timeZone: this.options.timeZone,
         });
-        if (planned && planned.kind !== "clarify" && planned.kind !== "not_task") {
+        if (planned && planned.kind !== "not_task") {
+          markGeminiResponseUsed(message);
           command = planned;
-          source = "gemini";
+          if (planned.kind !== "clarify") {
+            source = "gemini";
+          }
         }
       } catch {
         // Keep the deterministic clarification when the optional model is unavailable.
       }
+    }
+
+    if (command.kind === "not_task") {
+      await message.reply("I couldn't determine a local task command.");
+      return;
     }
 
     await this.handleCommand(message, command, source);
@@ -245,6 +316,13 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     });
     if (!pending || !isLocalTaskPendingActionPayload(pending.payload)) {
       return false;
+    }
+    if (pending.payload.source === "gemini") {
+      markGeminiResponseUsed(message);
+    }
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no local task change was made.");
+      return true;
     }
 
     if (instruction.kind === "cancel") {
@@ -281,7 +359,7 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
       } else if (isPendingTaskTransition(consumed)) {
         await this.executeTransition(message, consumed.operation, consumed.taskId, consumed.expectedRevision);
       } else {
-        await this.executeBulkCancellation(message, consumed.tasks);
+        await this.executeBulkCancellation(message, consumed.tasks, consumed.cleanupScope);
       }
       return true;
     }
@@ -347,11 +425,7 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
         await message.reply("Please provide a valid future Toronto date and time for that task.");
         return;
       }
-      if (source === "gemini") {
-        await this.queueCreateConfirmation(message, command.title, dueAt);
-      } else {
-        await this.executeCreate(message, { dueAt, timeZone: this.options.timeZone, title: command.title });
-      }
+      await this.executeCreate(message, { dueAt, timeZone: this.options.timeZone, title: command.title });
       return;
     }
     if (command.kind === "complete" || command.kind === "cancel") {
@@ -376,15 +450,16 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
         limit: displayLimit + 1,
         ownerId: this.options.ownerId,
       });
+    const displayDate = date ? formatDiscordDate(date, this.options.timeZone) : undefined;
     if (tasks.length === 0) {
-      await message.reply(`You have no active local tasks${date ? ` for ${date}` : ""}.`);
+      await message.reply(`You have no active local tasks${displayDate ? ` for ${displayDate}` : ""}.`);
       return;
     }
 
     const visible = tasks.slice(0, displayLimit);
     const more = tasks.length > visible.length ? "\nMore active tasks exist; complete or cancel some to keep this list short." : "";
-    const heading = date
-      ? `Active local tasks for ${date} (${this.options.timeZone})`
+    const heading = displayDate
+      ? `Active local tasks for ${displayDate} (${this.options.timeZone})`
       : `Active local tasks (${this.options.timeZone})`;
     await message.reply(
       `${heading}:\n${visible
@@ -393,16 +468,24 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     );
   }
 
-  private async handleBulkCancellation(message: OwnerDirectMessage, date?: string): Promise<void> {
-    const tasks = this.findBulkCancellationTasks(date);
-    const scope = date ? ` for ${date}` : "";
+  private async handleBulkCancellation(
+    message: OwnerDirectMessage,
+    date?: string,
+    futureOnly = false,
+    source: CommandSource = "deterministic",
+  ): Promise<void> {
+    const tasks = this.findBulkCancellationTasks(date, futureOnly);
+    const scope = date ? ` for ${formatDiscordDate(date, this.options.timeZone)}` : "";
+    const targetDescription = date && futureOnly
+      ? "future active local tasks"
+      : date ? "active local tasks" : "future active local tasks";
     if (tasks.length === 0) {
-      await message.reply(`You have no active local tasks${scope}.`);
+      await message.reply(`You have no ${targetDescription}${scope}.`);
       return;
     }
     if (tasks.length > MAX_BULK_LOCAL_TASK_CANCELLATIONS) {
       await message.reply(
-        `I found more than ${MAX_BULK_LOCAL_TASK_CANCELLATIONS} active local tasks${scope}. Narrow the request before deleting them.`,
+        `I found more than ${MAX_BULK_LOCAL_TASK_CANCELLATIONS} ${targetDescription}${scope}. Narrow the request before deleting them.`,
       );
       return;
     }
@@ -415,59 +498,94 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
       return;
     }
 
-    await this.queueBulkCancellationConfirmation(message, tasks, date);
+    await this.queueBulkCancellationConfirmation(message, tasks, date, futureOnly, source);
   }
 
-  private findBulkCancellationTasks(date?: string): readonly LocalTask[] {
+  private findBulkCancellationTasks(date?: string, futureOnly = false): readonly LocalTask[] {
     const limit = MAX_BULK_LOCAL_TASK_CANCELLATIONS + 1;
     if (!date) {
-      return this.options.stateRepository.listActiveLocalTasks({
+      const now = this.now();
+      return this.options.stateRepository.listActiveLocalTasksInRange({
+        dueAtEarliest: new Date(now.valueOf() + 1),
+        dueAtLatest: new Date("9999-12-31T23:59:59.999Z"),
         limit,
         ownerId: this.options.ownerId,
       });
     }
 
     const bounds = localTaskDateBounds(date, this.options.timeZone);
-    return bounds
-      ? this.options.stateRepository.listActiveLocalTasksInRange({
-        dueAtEarliest: bounds.earliest,
-        dueAtLatest: bounds.latest,
-        limit,
-        ownerId: this.options.ownerId,
-      })
-      : [];
+    if (!bounds) {
+      return [];
+    }
+    const earliest = futureOnly
+      ? new Date(Math.max(bounds.earliest.valueOf(), this.now().valueOf() + 1))
+      : bounds.earliest;
+    if (earliest > bounds.latest) {
+      return [];
+    }
+    return this.options.stateRepository.listActiveLocalTasksInRange({
+      dueAtEarliest: earliest,
+      dueAtLatest: bounds.latest,
+      limit,
+      ownerId: this.options.ownerId,
+    });
   }
 
   private async queueBulkCancellationConfirmation(
     message: OwnerDirectMessage,
     tasks: readonly LocalTask[],
     date?: string,
+    futureOnly = false,
+    source: CommandSource = "deterministic",
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no local task change was made; no confirmation was stored.");
+      return;
+    }
+
     const id = randomUUID();
     this.options.stateRepository.createPendingAction({
       expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
       id,
       ownerId: this.options.ownerId,
       payload: {
+        cleanupScope: futureOnly || !date ? "unscoped_future" : "date_scoped",
         kind: "local_task_bulk_cancel",
-        source: "deterministic",
+        source,
         tasks: tasks.map((task) => ({ expectedRevision: task.revision, id: task.id })),
       } satisfies PendingTaskBulkCancellation,
     });
-    const scope = date ? ` for ${date}` : "";
+    const scope = date ? ` for ${formatDiscordDate(date, this.options.timeZone)}` : "";
+    const targetDescription = date && !futureOnly ? "active local task" : "future active local task";
     const count = tasks.length;
     await message.reply(
-      `Review: delete ${count} active local task${count === 1 ? "" : "s"}${scope}. This will cancel ${count === 1 ? "it" : "them"} and stop future reminders. Reply confirm ${id} to continue or cancel ${id} to stop.`,
+      `Review: delete ${count} ${targetDescription}${count === 1 ? "" : "s"}${scope}. This will cancel ${count === 1 ? "it" : "them"} and stop future reminders. Reply confirm ${id} to continue or cancel ${id} to stop.`,
     );
   }
 
   private async executeBulkCancellation(
     message: OwnerDirectMessage,
     tasks: readonly LocalTaskCancellationTarget[],
+    cleanupScope: BulkCancellationScope,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no local task change was made.");
+      return;
+    }
+
+    const now = this.now();
+    if (cleanupScope === "unscoped_future" && !tasks.every((target) => {
+      const task = this.options.stateRepository.getLocalTask({ id: target.id, ownerId: this.options.ownerId });
+      return Boolean(task && task.status === "active" && task.revision === target.expectedRevision && task.dueAt > now);
+    })) {
+      this.audit("local_task_bulk_cancel", { count: tasks.length, reason: "tasks_changed_or_elapsed" }, "failed");
+      await message.reply("One or more local tasks changed or are no longer future. No tasks were changed; please repeat the request.");
+      return;
+    }
+
     try {
       const cancelled = this.options.stateRepository.cancelLocalTasks({
-        now: this.now(),
+        now,
         ownerId: this.options.ownerId,
         tasks,
       });
@@ -514,12 +632,8 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     message: OwnerDirectMessage,
     operation: LocalTaskOperation,
     task: LocalTask,
-    source: CommandSource,
+    _source: CommandSource,
   ): Promise<void> {
-    if (source === "gemini") {
-      await this.queueTransitionConfirmation(message, operation, task);
-      return;
-    }
     await this.executeTransition(message, operation, task.id, task.revision);
   }
 
@@ -530,6 +644,13 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     if (Number.isNaN(input.dueAt.valueOf()) || input.dueAt.valueOf() <= this.now().valueOf()) {
       this.audit("local_task_create", { reason: "due_time_passed" }, "failed");
       await message.reply("That task time has already passed. Please make a new request with a future time.");
+      return;
+    }
+
+    if (this.options.dryRun) {
+      await message.reply(
+        `Dry run: would create local task ${input.title} — ${formatTaskDueAt(input.dueAt, input.timeZone)}. No local task change was made.`,
+      );
       return;
     }
 
@@ -557,6 +678,11 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     taskId: string,
     expectedRevision: number,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no local task change was made.");
+      return;
+    }
+
     try {
       const task = operation === "complete"
         ? this.options.stateRepository.completeLocalTask({
@@ -591,6 +717,11 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
   }
 
   private async queueCreateConfirmation(message: OwnerDirectMessage, title: string, dueAt: Date): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no local task change was made; no confirmation was stored.");
+      return;
+    }
+
     const id = randomUUID();
     this.options.stateRepository.createPendingAction({
       expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
@@ -614,6 +745,11 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     operation: LocalTaskOperation,
     task: LocalTask,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no local task change was made; no confirmation was stored.");
+      return;
+    }
+
     const id = randomUUID();
     this.options.stateRepository.createPendingAction({
       expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
@@ -638,6 +774,11 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     tasks: readonly LocalTask[],
     source: CommandSource,
   ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no local task change was made; no task selection was stored.");
+      return;
+    }
+
     const id = randomUUID();
     this.options.stateRepository.createPendingAction({
       expiresAt: new Date(this.now().valueOf() + this.pendingActionTtlMilliseconds),
@@ -689,6 +830,9 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
     details: Record<string, unknown>,
     status: "failed" | "succeeded",
   ): void {
+    if (this.options.dryRun) {
+      return;
+    }
     this.options.stateRepository.recordAudit({
       actionType,
       actorId: this.options.ownerId,
@@ -696,6 +840,13 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
       status,
     });
   }
+}
+
+function toLocalTaskSelector(selector: { readonly date?: string | undefined; readonly title: string }): LocalTaskSelector {
+  return {
+    ...(selector.date ? { date: selector.date } : {}),
+    title: selector.title,
+  };
 }
 
 function titleTerms(value: string): readonly string[] {
