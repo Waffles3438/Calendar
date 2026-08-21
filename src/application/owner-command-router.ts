@@ -81,6 +81,7 @@ export interface OwnerCommandRouterOptions {
   readonly oauthService?: {
     beginAuthorization(ownerId: string): GoogleAuthorizationRequest;
   };
+  readonly onCalendarStateChanged?: () => void;
   readonly ownerId: string;
   readonly scheduleAssistant?: ScheduleMessageHandler;
   readonly stateRepository: RouterStateRepository;
@@ -122,6 +123,7 @@ export class OwnerCommandRouter {
         return;
       }
       this.options.stateRepository.clearGoogleOAuth();
+      this.options.onCalendarStateChanged?.();
       await routedMessage.reply("Google Calendar has been disconnected from this bot.");
       return;
     }

@@ -8,10 +8,12 @@ import {
 } from "./config.js";
 import { DiscordBot } from "./discord/discord-bot.js";
 import { GoogleCalendarApi } from "./google/calendar-api.js";
+import { CalendarChangeTracker, TrackedCalendarGateway } from "./google/calendar-change-tracker.js";
 import { GoogleOAuthCallbackHandler } from "./google/oauth-callback.js";
 import { GoogleApiOAuthProvider, GoogleOAuthService } from "./google/oauth-service.js";
 import { startHealthServer, type HealthServer } from "./http/health-server.js";
 import { createLogger } from "./logger.js";
+import { CachingNaturalLanguageActionPlanner } from "./nlp/caching-natural-language-action-planner.js";
 import { GeminiActionPlanner } from "./nlp/gemini-action-planner.js";
 import { AppStateRepository } from "./persistence/state-repository.js";
 import { ReminderScheduler } from "./reminders/reminder-scheduler.js";
@@ -60,13 +62,6 @@ async function main(): Promise<void> {
         encryptionSecret: localIntegration.encryptionKey,
       });
 
-      const naturalLanguagePlanner = geminiFallback
-        ? new GeminiActionPlanner({
-          apiKey: geminiFallback.apiKey,
-          logger,
-          model: geminiFallback.model,
-        })
-        : undefined;
       const localTaskAssistant = new LocalTaskAssistant({
         logger,
         ownerId: localIntegration.discordOwnerId,
@@ -75,7 +70,8 @@ async function main(): Promise<void> {
       });
 
       let calendarAssistant: CalendarAssistant | undefined;
-      let calendarGateway: GoogleCalendarApi | undefined;
+      let calendarGateway: TrackedCalendarGateway | undefined;
+      let calendarChangeTracker: CalendarChangeTracker | undefined;
       let oauthService: GoogleOAuthService | undefined;
       if (googleIntegration) {
         oauthService = new GoogleOAuthService({
@@ -86,12 +82,14 @@ async function main(): Promise<void> {
           }),
           stateRepository,
         });
-        calendarGateway = new GoogleCalendarApi({
+        const rawCalendarGateway = new GoogleCalendarApi({
           clientId: googleIntegration.googleClientId,
           clientSecret: googleIntegration.googleClientSecret,
           redirectUri: googleIntegration.googleRedirectUri,
           stateRepository,
         });
+        calendarChangeTracker = new CalendarChangeTracker();
+        calendarGateway = new TrackedCalendarGateway(rawCalendarGateway, calendarChangeTracker);
         calendarAssistant = new CalendarAssistant({
           calendarGateway,
           logger,
@@ -99,6 +97,19 @@ async function main(): Promise<void> {
           stateRepository,
         });
       }
+
+      const naturalLanguagePlanner = geminiFallback
+        ? new CachingNaturalLanguageActionPlanner({
+          ...(calendarChangeTracker ? { calendarChanges: calendarChangeTracker } : {}),
+          model: geminiFallback.model,
+          ownerId: localIntegration.discordOwnerId,
+          planner: new GeminiActionPlanner({
+            apiKey: geminiFallback.apiKey,
+            logger,
+            model: geminiFallback.model,
+          }),
+        })
+        : undefined;
 
       const scheduleAssistant = new ScheduleAssistant({
         ...(calendarGateway ? { calendarGateway } : {}),
@@ -122,6 +133,9 @@ async function main(): Promise<void> {
         ...(calendarGateway ? { calendarReader: calendarGateway } : {}),
         ...(oauthService ? { oauthService } : {}),
         ...(naturalLanguagePlanner ? { naturalLanguagePlanner } : {}),
+        ...(calendarChangeTracker ? {
+          onCalendarStateChanged: () => calendarChangeTracker?.markChanged(),
+        } : {}),
         geminiResponseLabelEnabled: config.GEMINI_RESPONSE_LABEL_ENABLED,
         localTaskAssistant,
         ownerId: localIntegration.discordOwnerId,
@@ -184,6 +198,7 @@ async function main(): Promise<void> {
           logger,
           oauthService,
           onAuthorized: async () => {
+            calendarChangeTracker?.markChanged();
             await discordBot?.sendOwnerMessage(
               "Google Calendar is connected. Send /status to verify the primary calendar.",
             );

@@ -67,6 +67,24 @@ describe("OwnerCommandRouter", () => {
 
     expect(input.replies).toEqual([expect.stringContaining("America/Chicago")]);
   });
+
+  it("notifies Calendar-dependent caches after a successful disconnect", async () => {
+    const clearGoogleOAuth = vi.fn();
+    const onCalendarStateChanged = vi.fn();
+    const router = new OwnerCommandRouter({
+      onCalendarStateChanged,
+      oauthService: { beginAuthorization: () => ({ authorizationUrl: "unused", state: "unused" }) },
+      ownerId: "123456789012345678",
+      stateRepository: { clearGoogleOAuth },
+    });
+    const input = message("/disconnect");
+
+    await router.handle(input);
+
+    expect(clearGoogleOAuth).toHaveBeenCalledTimes(1);
+    expect(onCalendarStateChanged).toHaveBeenCalledTimes(1);
+    expect(input.replies).toEqual(["Google Calendar has been disconnected from this bot."]);
+  });
 });
 
 
