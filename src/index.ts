@@ -1,17 +1,25 @@
-import { CalendarAssistant } from "./application/calendar-assistant.js";
+import type { CalendarAssistant } from "./application/calendar-assistant.js";
+import {
+  createCalendarManagementRuntime,
+  type CalendarManagementRuntime,
+} from "./application/calendar-management-runtime.js";
+import type { CalendarManagementAssistant } from "./application/calendar-management-assistant.js";
+import { NamedDeleteHandler } from "./application/named-delete-handler.js";
+import { NamedDeleteResolver } from "./application/named-delete-resolver.js";
 import { OwnerCommandRouter } from "./application/owner-command-router.js";
 import {
   getGeminiFallbackConfig,
   getGoogleCalendarConfig,
   getLocalBotConfig,
+  getWebUiConfig,
   loadConfig,
 } from "./config.js";
 import { DiscordBot } from "./discord/discord-bot.js";
-import { GoogleCalendarApi } from "./google/calendar-api.js";
-import { CalendarChangeTracker, TrackedCalendarGateway } from "./google/calendar-change-tracker.js";
-import { GoogleOAuthCallbackHandler } from "./google/oauth-callback.js";
-import { GoogleApiOAuthProvider, GoogleOAuthService } from "./google/oauth-service.js";
+import type { TrackedCalendarGateway, CalendarChangeTracker } from "./google/calendar-change-tracker.js";
+import type { GoogleOAuthCallbackHandler } from "./google/oauth-callback.js";
+import type { GoogleOAuthService } from "./google/oauth-service.js";
 import { startHealthServer, type HealthServer } from "./http/health-server.js";
+import type { CalendarWebApplication } from "./http/calendar-web.js";
 import { createLogger } from "./logger.js";
 import { CachingNaturalLanguageActionPlanner } from "./nlp/caching-natural-language-action-planner.js";
 import { GeminiActionPlanner } from "./nlp/gemini-action-planner.js";
@@ -31,6 +39,7 @@ async function main(): Promise<void> {
   const localIntegration = getLocalBotConfig(config);
   const googleIntegration = getGoogleCalendarConfig(config);
   const geminiFallback = getGeminiFallbackConfig(config);
+  const webIntegration = getWebUiConfig(config);
 
   logger.info({
     geminiApiKeyConfigured: Boolean(config.GEMINI_API_KEY),
@@ -48,6 +57,7 @@ async function main(): Promise<void> {
   let scheduledReminderScheduler: ScheduledReminderScheduler | undefined;
   let dailyAgendaScheduler: DailyAgendaScheduler | undefined;
   let healthServer: HealthServer | undefined;
+  let calendarWebApplication: CalendarWebApplication | undefined;
 
   try {
     let oauthCallback: GoogleOAuthCallbackHandler | undefined;
@@ -70,32 +80,33 @@ async function main(): Promise<void> {
       });
 
       let calendarAssistant: CalendarAssistant | undefined;
+      let calendarManagementAssistant: CalendarManagementAssistant | undefined;
       let calendarGateway: TrackedCalendarGateway | undefined;
       let calendarChangeTracker: CalendarChangeTracker | undefined;
       let oauthService: GoogleOAuthService | undefined;
+      let calendarRuntime: CalendarManagementRuntime | undefined;
       if (googleIntegration) {
-        oauthService = new GoogleOAuthService({
-          provider: new GoogleApiOAuthProvider({
-            clientId: googleIntegration.googleClientId,
-            clientSecret: googleIntegration.googleClientSecret,
-            redirectUri: googleIntegration.googleRedirectUri,
-          }),
-          stateRepository,
-        });
-        const rawCalendarGateway = new GoogleCalendarApi({
-          clientId: googleIntegration.googleClientId,
-          clientSecret: googleIntegration.googleClientSecret,
-          redirectUri: googleIntegration.googleRedirectUri,
-          stateRepository,
-        });
-        calendarChangeTracker = new CalendarChangeTracker();
-        calendarGateway = new TrackedCalendarGateway(rawCalendarGateway, calendarChangeTracker);
-        calendarAssistant = new CalendarAssistant({
-          calendarGateway,
+        calendarRuntime = createCalendarManagementRuntime({
+          ...(webIntegration ? { webIntegration } : {}),
+          cookieSecure: config.NODE_ENV === "production",
+          googleIntegration,
+          localIntegration,
           logger,
-          ownerId: localIntegration.discordOwnerId,
+          onAuthorized: async () => {
+            calendarRuntime?.calendarChangeTracker.markChanged();
+            await discordBot?.sendOwnerMessage(
+              "Google Calendar is connected. Send /status to verify the primary calendar.",
+            );
+          },
           stateRepository,
         });
+        calendarAssistant = calendarRuntime.calendarAssistant;
+        calendarManagementAssistant = calendarRuntime.calendarManagementAssistant;
+        calendarGateway = calendarRuntime.calendarGateway;
+        calendarChangeTracker = calendarRuntime.calendarChangeTracker;
+        oauthService = calendarRuntime.oauthService;
+        oauthCallback = calendarRuntime.oauthCallback;
+        calendarWebApplication = calendarRuntime.calendarWebApplication;
       }
 
       const naturalLanguagePlanner = geminiFallback
@@ -121,6 +132,25 @@ async function main(): Promise<void> {
         stateRepository,
         timeZone: localIntegration.taskTimeZone,
       });
+      const namedDeleteResolver = new NamedDeleteResolver({
+        ...(calendarGateway ? { calendarGateway } : {}),
+        logger,
+        ownerId: localIntegration.discordOwnerId,
+        schedulingRepository,
+        stateRepository,
+        timeZone: localIntegration.taskTimeZone,
+      });
+      const namedDeleteHandler = new NamedDeleteHandler({
+        ...(calendarAssistant ? { calendarAssistant } : {}),
+        ...(calendarGateway ? { calendarGateway } : {}),
+        localTaskAssistant,
+        ownerId: localIntegration.discordOwnerId,
+        resolver: namedDeleteResolver,
+        scheduleAssistant,
+        schedulingRepository,
+        stateRepository,
+        timeZone: localIntegration.taskTimeZone,
+      });
       const agendaService = new AgendaService({
         ...(calendarGateway ? { calendarGateway } : {}),
         legacyTaskReader: stateRepository,
@@ -130,6 +160,7 @@ async function main(): Promise<void> {
       });
       const commandRouter = new OwnerCommandRouter({
         ...(calendarAssistant ? { calendarAssistant } : {}),
+        ...(calendarManagementAssistant ? { calendarManagementAssistant } : {}),
         ...(calendarGateway ? { calendarReader: calendarGateway } : {}),
         ...(oauthService ? { oauthService } : {}),
         ...(naturalLanguagePlanner ? { naturalLanguagePlanner } : {}),
@@ -138,6 +169,7 @@ async function main(): Promise<void> {
         } : {}),
         geminiResponseLabelEnabled: config.GEMINI_RESPONSE_LABEL_ENABLED,
         localTaskAssistant,
+        namedDeleteHandler,
         ownerId: localIntegration.discordOwnerId,
         scheduleAssistant,
         stateRepository,
@@ -193,18 +225,6 @@ async function main(): Promise<void> {
         });
       }
 
-      if (oauthService) {
-        oauthCallback = new GoogleOAuthCallbackHandler({
-          logger,
-          oauthService,
-          onAuthorized: async () => {
-            calendarChangeTracker?.markChanged();
-            await discordBot?.sendOwnerMessage(
-              "Google Calendar is connected. Send /status to verify the primary calendar.",
-            );
-          },
-        });
-      }
     }
 
     healthServer = await startHealthServer({
@@ -212,6 +232,7 @@ async function main(): Promise<void> {
       logger,
       ...(oauthCallback ? { oauthCallback } : {}),
       port: config.PORT,
+      ...(calendarWebApplication ? { webApplication: calendarWebApplication } : {}),
     });
 
     if (discordBot) {

@@ -3,6 +3,8 @@ import type { AddressInfo } from "node:net";
 
 import type { Logger } from "pino";
 
+import type { HttpApplication } from "./calendar-web.js";
+
 export interface OAuthCallbackHandler {
   readonly path: string;
   handle(input: {
@@ -21,6 +23,7 @@ export interface HealthServerOptions {
   readonly logger: Logger;
   readonly oauthCallback?: OAuthCallbackHandler;
   readonly port: number;
+  readonly webApplication?: HttpApplication;
 }
 
 export interface HealthServer {
@@ -47,10 +50,11 @@ function writeHtml(response: ServerResponse, statusCode: number, body: string): 
 function createRequestHandler(
   isReady: () => boolean,
   oauthCallback: OAuthCallbackHandler | undefined,
+  webApplication: HttpApplication | undefined,
   logger: Logger,
 ): (request: IncomingMessage, response: ServerResponse) => void {
   return (request, response): void => {
-    void handleRequest(request, response, isReady, oauthCallback, logger).catch((error: unknown) => {
+    void handleRequest(request, response, isReady, oauthCallback, webApplication, logger).catch((error: unknown) => {
       logger.error({ error }, "Unhandled health server request failure");
       if (!response.headersSent) {
         writeJson(response, 500, { error: "internal_server_error" });
@@ -64,9 +68,14 @@ async function handleRequest(
   response: ServerResponse,
   isReady: () => boolean,
   oauthCallback: OAuthCallbackHandler | undefined,
+  webApplication: HttpApplication | undefined,
   logger: Logger,
 ): Promise<void> {
   const url = new URL(request.url ?? "/", "http://localhost");
+
+  if (webApplication && await webApplication.handle(request, response, url)) {
+    return;
+  }
 
   if (request.method !== "GET") {
     response.setHeader("allow", "GET");
@@ -132,7 +141,12 @@ function close(server: Server): Promise<void> {
 
 export async function startHealthServer(options: HealthServerOptions): Promise<HealthServer> {
   const isReady = options.isReady ?? (() => true);
-  const server = createServer(createRequestHandler(isReady, options.oauthCallback, options.logger));
+  const server = createServer(createRequestHandler(
+    isReady,
+    options.oauthCallback,
+    options.webApplication,
+    options.logger,
+  ));
 
   await listen(server, options.host, options.port);
 

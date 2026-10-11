@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { LegacyTaskCandidate } from "../src/application/named-delete-resolver.js";
 import { withGeminiResponseAttribution } from "../src/application/gemini-response-attribution.js";
 import { createLogger } from "../src/logger.js";
 import type { PendingAction } from "../src/persistence/state-repository.js";
@@ -598,6 +599,88 @@ describe("LocalTaskAssistant", () => {
     const cancel = await runTransition("cancel", "cancel-task", "Walk");
     expect(cancel.getLocalTask({ id: "cancel-task", ownerId })).toMatchObject({ status: "cancelled" });
   });
+
+  it.each([
+    {
+      expectedStatus: "cancelled" as const,
+      label: "lowercases and separates punctuation",
+      selectorTitle: "CALL, PLUMBER",
+      taskTitle: "Call-Plumber",
+    },
+    {
+      expectedStatus: "cancelled" as const,
+      label: "ignores generic selector words",
+      selectorTitle: "the task to call plumber",
+      taskTitle: "Call plumber",
+    },
+    {
+      expectedStatus: "active" as const,
+      label: "requires every non-generic term",
+      selectorTitle: "call plumber",
+      taskTitle: "Call dentist",
+    },
+    {
+      expectedStatus: "cancelled" as const,
+      label: "keeps a lowercase fallback for an all-generic selector",
+      selectorTitle: "the to",
+      taskTitle: "the to",
+    },
+  ])("preserves selector semantics when it $label", async ({ expectedStatus, selectorTitle, taskTitle }) => {
+    const state = new FakeTaskState();
+    state.createLocalTask({
+      dueAt: new Date("2026-08-19T14:00:00.000Z"),
+      id: "selector-task",
+      now,
+      ownerId,
+      timeZone: "America/Toronto",
+      title: taskTitle,
+    });
+    const assistant = createAssistant(state);
+    const request = message(`delete task ${selectorTitle}`);
+
+    await assistant.handleNaturalLanguageAction(request, {
+      action: "delete_task",
+      scope: "single",
+      selector: { title: selectorTitle },
+    });
+
+    expect(state.getLocalTask({ id: "selector-task", ownerId })?.status).toBe(expectedStatus);
+    if (expectedStatus === "active") {
+      expect(request.replies).toEqual([expect.stringMatching(/could not find an active local task/i)]);
+    } else {
+      expect(request.replies).toEqual([expect.stringMatching(/Cancelled local task/i)]);
+    }
+  });
+
+  it("filters a single selector by the task's stored local date", async () => {
+    const state = new FakeTaskState();
+    state.createLocalTask({
+      dueAt: new Date("2026-08-19T03:00:00.000Z"),
+      id: "prior-local-date",
+      now,
+      ownerId,
+      timeZone: "America/Toronto",
+      title: "Call plumber",
+    });
+    state.createLocalTask({
+      dueAt: new Date("2026-08-19T04:00:00.000Z"),
+      id: "selected-local-date",
+      now,
+      ownerId,
+      timeZone: "America/Toronto",
+      title: "Call plumber",
+    });
+    const assistant = createAssistant(state);
+
+    await assistant.handleNaturalLanguageAction(message("delete task call plumber on 2026-08-19"), {
+      action: "delete_task",
+      scope: "single",
+      selector: { date: "2026-08-19", title: "call plumber" },
+    });
+
+    expect(state.getLocalTask({ id: "prior-local-date", ownerId })).toMatchObject({ status: "active" });
+    expect(state.getLocalTask({ id: "selected-local-date", ownerId })).toMatchObject({ status: "cancelled" });
+  });
 });
 
 
@@ -715,5 +798,50 @@ describe("LocalTaskAssistant unified deletion policy", () => {
       selector: { title: "missing" },
     });
     expect(noneRequest.replies).toEqual([expect.stringMatching(/could not find an active local task/i)]);
+  });
+});
+
+
+describe("LocalTaskAssistant resolved named-delete preservation matrix", () => {
+  const staleFixtures = [
+    { existingOwner: ownerId, label: "a changed expected revision", mode: "revision" as const },
+    { existingOwner: "987654321098765432", label: "an owner-mismatched task", mode: "owner" as const },
+  ] as const;
+
+  // **Validates: Requirements 2.1, 2.6, 2.7, 3.6, 3.7**
+  it.each(staleFixtures)("keeps $label fail-closed", async ({ existingOwner, mode }) => {
+    const state = new FakeTaskState();
+    const task = state.createLocalTask({
+      dueAt: new Date("2026-08-18T22:00:00.000Z"),
+      id: `resolved-preservation-${mode}`,
+      now,
+      ownerId: existingOwner,
+      timeZone: "America/Toronto",
+      title: "Play among us",
+    });
+    const original = { ...task };
+    if (mode === "revision") {
+      state.tasks.set(task.id, { ...task, revision: task.revision + 1 });
+    }
+    const assistant = createAssistant(state);
+    const candidate: LegacyTaskCandidate = {
+      domain: "legacy_task",
+      dueAt: task.dueAt.toISOString(),
+      expectedRevision: task.revision,
+      localDate: "2026-08-18",
+      taskId: task.id,
+      timeZone: task.timeZone,
+      title: task.title,
+    };
+    const request = message("delete play among us");
+
+    await assistant.handleResolvedNamedCancellation(request, candidate);
+
+    expect(request.replies).toEqual([expect.stringMatching(/changed before it could be updated/i)]);
+    expect(state.pending.size).toBe(0);
+    expect(state.getLocalTask({ id: task.id, ownerId: existingOwner })).toEqual(
+      mode === "revision" ? { ...original, revision: original.revision + 1 } : original,
+    );
+    expect(state.audits).toContainEqual(expect.objectContaining({ actionType: "local_task_cancel", status: "failed" }));
   });
 });

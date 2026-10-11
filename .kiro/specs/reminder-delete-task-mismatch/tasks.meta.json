@@ -1,0 +1,114 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. **Property 1: Bug Condition** - Reproduce the named scheduled-reminder deletion mismatch": [
+      {
+        "executionId": "f3848a08-60aa-451f-8c82-26020f218142",
+        "chatSessionId": "sess_50131d37-d5c2-47e3-a024-8d872f57d1ba",
+        "timestamp": 1787444393339
+      },
+      {
+        "executionId": "f3848a08-60aa-451f-8c82-26020f218142",
+        "chatSessionId": "sess_50131d37-d5c2-47e3-a024-8d872f57d1ba",
+        "timestamp": 1787444397345
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445480248
+      }
+    ],
+    "2. **Property 2: Preservation** - Preserve non-buggy routing, matching, and mutation behavior": [
+      {
+        "executionId": "f3848a08-60aa-451f-8c82-26020f218142",
+        "chatSessionId": "sess_50131d37-d5c2-47e3-a024-8d872f57d1ba",
+        "timestamp": 1787444393392
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787444546927
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787444784751
+      }
+    ],
+    "3.1 Implement the source changes in dependency order": [
+      {
+        "executionId": "f3848a08-60aa-451f-8c82-26020f218142",
+        "chatSessionId": "sess_50131d37-d5c2-47e3-a024-8d872f57d1ba",
+        "timestamp": 1787444393453
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787444789520
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445154410
+      }
+    ],
+    "3.2 **Property 1: Expected Behavior** - Re-run the named scheduled-reminder deletion reproduction after the fix": [
+      {
+        "executionId": "f3848a08-60aa-451f-8c82-26020f218142",
+        "chatSessionId": "sess_50131d37-d5c2-47e3-a024-8d872f57d1ba",
+        "timestamp": 1787444393519
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445168637
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445222283
+      }
+    ],
+    "3.3 **Property 2: Preservation** - Re-run non-buggy behavior checks after the fix": [
+      {
+        "executionId": "f3848a08-60aa-451f-8c82-26020f218142",
+        "chatSessionId": "sess_50131d37-d5c2-47e3-a024-8d872f57d1ba",
+        "timestamp": 1787444393569
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445227165
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445270934
+      }
+    ],
+    "4. Checkpoint - Run the full validation suite": [
+      {
+        "executionId": "f3848a08-60aa-451f-8c82-26020f218142",
+        "chatSessionId": "sess_50131d37-d5c2-47e3-a024-8d872f57d1ba",
+        "timestamp": 1787444393615
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445275795
+      },
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445369120
+      }
+    ],
+    "3. Implement narrow single-delete scheduled-reminder routing and reviewed cancellation": [
+      {
+        "executionId": "5a668471-db2d-4c32-bf77-0f3de264b5b0",
+        "chatSessionId": "sess_9c6fef48-c33c-451f-bc8f-c93cdd9985b4",
+        "timestamp": 1787445270981
+      }
+    ]
+  }
+}

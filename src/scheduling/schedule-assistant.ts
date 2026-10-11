@@ -5,6 +5,7 @@ import type { Logger } from "pino";
 
 import type { PendingActionInstruction, PendingActionMessageHandler } from "../application/pending-action.js";
 import { markGeminiResponseUsed } from "../application/gemini-response-attribution.js";
+import type { ScheduledReminderCandidate } from "../application/named-delete-resolver.js";
 import { calendarDateTimeToDateTime } from "../calendar/event-time.js";
 import { hasExternalGuests, isRecurringEvent, type CalendarEvent, type CalendarReference, type TimedEventDateTime } from "../domain/calendar.js";
 import { formatDiscordDate, formatDiscordTimestamp } from "../discord/discord-timestamp.js";
@@ -16,6 +17,7 @@ import {
   type LocalTask,
   type LocalTaskCancellationTarget,
 } from "../tasks/task-domain.js";
+import { normalizeTaskSelectorTerms, titleMatchesTaskSelector } from "../tasks/task-selector.js";
 import { validateLocalTaskDateTime } from "../tasks/task-time.js";
 import { evaluateMutationSafety } from "../policy/mutation-policy.js";
 import { AgendaService, type LegacyTaskAgendaReader } from "./agenda-service.js";
@@ -301,7 +303,7 @@ export class ScheduleAssistant implements PendingActionMessageHandler {
   public async handleNaturalLanguageAction(
     message: OwnerDirectMessage,
     action: Extract<NaturalLanguageAction, {
-      action: "cleanup_schedule" | "create_calendar_event" | "create_task_or_reminder" | "show_agenda";
+      action: "cleanup_schedule" | "create_calendar_event" | "create_task_or_reminder" | "delete_task" | "show_agenda";
     }>,
   ): Promise<boolean> {
     switch (action.action) {
@@ -323,6 +325,11 @@ export class ScheduleAssistant implements PendingActionMessageHandler {
           title: action.title,
         }, "gemini");
         return true;
+      case "delete_task":
+        if (action.scope !== "single" || !action.selector) {
+          return false;
+        }
+        return this.tryHandleNamedScheduledReminderDeletion(message, action);
       case "create_task_or_reminder":
         await this.execute(message, {
           date: action.date,
@@ -346,6 +353,122 @@ export class ScheduleAssistant implements PendingActionMessageHandler {
         }, "gemini");
         return true;
     }
+  }
+
+  private async tryHandleNamedScheduledReminderDeletion(
+    message: OwnerDirectMessage,
+    action: Extract<NaturalLanguageAction, { action: "delete_task" }>,
+  ): Promise<boolean> {
+    const selector = action.selector;
+    if (!selector || !selector.title.trim()) {
+      return false;
+    }
+    if (action.date && selector.date && action.date !== selector.date) {
+      await message.reply("I could not safely review that deletion request. No changes were made; please try again.");
+      return true;
+    }
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no scheduled item or calendar change was made; no confirmation was stored.");
+      return true;
+    }
+
+    const now = this.now();
+    const selectorDate = selector.date ?? action.date;
+    const selectorTerms = normalizeTaskSelectorTerms(selector.title);
+    const today = localDate(now, this.options.timeZone);
+    const throughDate = DateTime.fromJSDate(now, { zone: this.options.timeZone })
+      .plus({ years: CLEANUP_LOOKAHEAD_YEARS })
+      .toFormat("yyyy-LL-dd");
+    try {
+      this.options.schedulingRepository.ensureOccurrencesThrough({
+        now,
+        ownerId: this.options.ownerId,
+        throughDate,
+      });
+      const candidates = this.options.schedulingRepository.listActiveScheduledItems({
+        kinds: ["reminder"],
+        ownerId: this.options.ownerId,
+        scheduledDateEarliest: selectorDate ?? today,
+        scheduledDateLatest: selectorDate ?? throughDate,
+      }).filter((item) =>
+        item.ownerId === this.options.ownerId &&
+        item.kind === "reminder" &&
+        item.status === "active" &&
+        titleMatchesTaskSelector(item.title, selectorTerms) &&
+        (selectorDate
+          ? item.scheduledDate === selectorDate
+          : Boolean(item.dueAt && Number.isFinite(item.dueAt.valueOf()) && item.dueAt > now)),
+      );
+
+      if (candidates.length === 0) {
+        return false;
+      }
+
+      await this.prepareCleanup(message, {
+        ...(selectorDate ? { date: selectorDate } : {}),
+        kind: "cleanup",
+        mode: "named",
+        targetKinds: ["reminder"],
+        terms: selectorTerms,
+        title: selector.title,
+      }, "gemini", { includeLegacy: false });
+      return true;
+    } catch (error: unknown) {
+      this.options.logger.error({ error }, "Could not prepare named scheduled reminder deletion");
+      await message.reply("I could not safely review every matching scheduled item. No changes were made; please try again.");
+      return true;
+    }
+  }
+
+  /**
+   * Prepares the existing reviewed cleanup flow for one resolver-captured
+   * reminder occurrence. A series identifier is deliberately not converted to
+   * a series cancellation here.
+   */
+  public async handleResolvedNamedReminderCancellation(
+    message: OwnerDirectMessage,
+    candidate: ScheduledReminderCandidate,
+    selectorDate?: string,
+  ): Promise<void> {
+    if (this.options.dryRun) {
+      await message.reply("Dry run: no scheduled item change was made; no confirmation was stored.");
+      return;
+    }
+
+    const pending: PendingScheduleCleanup = {
+      calendarEvents: [],
+      cleanupScope: selectorDate ? "date_scoped" : "unscoped_future",
+      items: [{ expectedRevision: candidate.expectedRevision, id: candidate.itemId }],
+      kind: "schedule_cleanup",
+      legacyItems: [],
+      responseSource: "gemini",
+      series: [],
+    };
+    if (!candidate.seriesId && !candidate.occurrenceKey) {
+      await this.executeCleanup(message, pending);
+      return;
+    }
+
+    const id = randomUUID();
+    try {
+      this.options.stateRepository.createPendingAction({
+        expiresAt: new Date(this.now().valueOf() + CLEANUP_TTL_MILLISECONDS),
+        id,
+        ownerId: this.options.ownerId,
+        payload: pending,
+      });
+    } catch (error: unknown) {
+      this.options.logger.error({ error: error instanceof Error ? error.name : "unknown" }, "Could not prepare named reminder cancellation");
+      await message.reply("I could not safely prepare that reminder cancellation. No changes were made; please try again.");
+      return;
+    }
+
+    const when = candidate.dueAt
+      ? formatDiscordTimestamp(new Date(candidate.dueAt))
+      : formatDiscordDate(candidate.scheduledDate, candidate.timeZone);
+    await message.reply(
+      `Review: cancel reminder ${candidate.title} — ${when}. This action requires confirmation because it was model-proposed. Reply confirm ${id} to continue or cancel ${id} to stop.`,
+    );
   }
 
   public canHandlePendingAction(payload: unknown): boolean {
@@ -695,6 +818,7 @@ export class ScheduleAssistant implements PendingActionMessageHandler {
     message: OwnerDirectMessage,
     command: Extract<ExecutableScheduleCommand, { readonly kind: "cleanup" }>,
     responseSource: CleanupResponseSource,
+    options: { readonly includeLegacy?: boolean } = {},
   ): Promise<void> {
     if (this.options.dryRun) {
       await message.reply("Dry run: no scheduled item or calendar change was made; no confirmation was stored.");
@@ -702,6 +826,7 @@ export class ScheduleAssistant implements PendingActionMessageHandler {
     }
     const now = this.now();
     const today = localDate(now, this.options.timeZone);
+    const includeLegacy = options.includeLegacy ?? true;
     try {
       this.options.schedulingRepository.ensureOccurrencesThrough({
         now,
@@ -722,7 +847,9 @@ export class ScheduleAssistant implements PendingActionMessageHandler {
         );
       const localSingles = command.date ? local : local.filter((item) => !item.seriesId);
       const series = command.date ? [] : uniqueSeries(local);
-      const legacySearch = this.findLegacyCleanupCandidates(command, now);
+      const legacySearch: LegacyCleanupCandidateSearch = includeLegacy
+        ? this.findLegacyCleanupCandidates(command, now)
+        : { candidates: [], mayBeTruncated: false };
       const legacy = legacySearch.candidates;
       const calendarEvents = await this.findCalendarCleanupCandidates(command, now);
       const targetCount = this.cleanupTargetCount({

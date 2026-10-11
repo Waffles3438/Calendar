@@ -1,0 +1,193 @@
+{
+  "pbtResults": {
+    "1. Write the bug-condition exploration test": {
+      "status": "passed",
+      "failingExample": "Vitest run: `expects direct mutation for 'an exact private one-time reminder'` observed `createPendingAction` called once with payload `{ kind: \"schedule_cleanup\", cleanupScope: \"unscoped_future\", items: [{ expectedRevision: 1, id: \"exploration-private-reminder\" }] }`; reply was `Review: cancel reminder Play among us ... Reply confirm <uuid> ...`; target remained `active`, revision `1`, and remained in `listDueScheduledReminders`. `expects direct mutation for 'an exact private non-recurring Calendar event'` observed `createPendingAction` called once with payload `{ kind: \"mutation\", eventId: \"exploration-private-calendar-event\", expectedEtag: \"exploration-private-etag\", namedDelete: true, sendUpdates: \"none\" }`; reply was `Review: delete Play among us ... Reply confirm <uuid> ...`; `deleteCalls` remained empty and the target event remained present. The local-task, shared-Calendar, series-linked reminder, and materialized reminder controls passed.",
+      "lastRunTimestamp": 1787452346184
+    },
+    "2. Write preservation property tests before implementing the fix": {
+      "status": "failed",
+      "failingExample": "Unfixed preservation matrix run: (1) test/local-task-assistant.test.ts, 'keeps a changed expected revision fail-closed' and 'keeps an owner-mismatched task fail-closed' failed because the observed audit is [{ actionType: 'local_task_cancel', actorId: '123456789012345678', details: { reason: 'task_changed', taskId: 'resolved-preservation-revision|resolved-preservation-owner' }, status: 'failed' }] rather than the narrower expected object; (2) test/named-delete-resolver.test.ts, 'keeps an elapsed future-only Calendar event fail-closed' observed a confirmation review because the fixture start 2026-08-18T10:00:00-04:00 is 2026-08-18T14:00:00Z, after the fixed now 2026-08-18T12:00:00Z.",
+      "lastRunTimestamp": 1787452564102
+    },
+    "3.4 Verify the bug-condition exploration test now passes": {
+      "status": "passed",
+      "lastRunTimestamp": 1787456410295
+    },
+    "3.5 Verify preservation property tests still pass": {
+      "status": "passed",
+      "failingExample": "",
+      "lastRunTimestamp": 1787456473669
+    }
+  },
+  "executionHistory": {
+    "1. Write the bug-condition exploration test": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174168
+      },
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452178669
+      },
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452368038
+      }
+    ],
+    "2. Write preservation property tests before implementing the fix": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174219
+      },
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452371467
+      }
+    ],
+    "3.1 Execute exact one-time scheduled reminders through the existing cleanup mutation": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174264
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787454975019
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787454979781
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787455084528
+      }
+    ],
+    "3.2 Execute exact private non-recurring Calendar events with a narrow internal intent": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174322
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787454975100
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787455087951
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456041726
+      }
+    ],
+    "3.3 Preserve centralized resolution, ambiguity handling, and direct local-task behavior": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174380
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787454975190
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456045376
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456201996
+      }
+    ],
+    "3.4 Verify the bug-condition exploration test now passes": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174420
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787454975262
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456206132
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456436489
+      }
+    ],
+    "3.5 Verify preservation property tests still pass": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174460
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787454975324
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456441375
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456521702
+      }
+    ],
+    "4. Checkpoint - ensure all tests and checks pass": [
+      {
+        "executionId": "20761cb1-3ed4-42c9-8257-5df661d21ac1",
+        "chatSessionId": "sess_5d88b0d4-46d1-4c60-bcd1-d87bd6cd692b",
+        "timestamp": 1787452174498
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787454975389
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456526158
+      },
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456589077
+      }
+    ],
+    "3. Implement the exact-private single named-delete correction": [
+      {
+        "executionId": "588aab8e-7067-40a0-92a4-04c14bb52e54",
+        "chatSessionId": "sess_cfec50ee-89c7-4b17-b2da-d8ea8d743222",
+        "timestamp": 1787456521797
+      }
+    ]
+  }
+}

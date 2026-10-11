@@ -42,6 +42,14 @@ const taskTimeZone = z.preprocess(
     .refine((value) => IANAZone.isValidZone(value), "must be a valid IANA time zone")
     .default(DEFAULT_TASK_TIME_ZONE),
 );
+const webToken = z.preprocess(
+  emptyStringToUndefined,
+  z.string().trim().min(32, "must contain at least 32 characters").optional(),
+);
+const webOwnerId = z.preprocess(
+  emptyStringToUndefined,
+  z.string().trim().min(1).max(128).optional(),
+);
 
 const configSchema = z
   .object({
@@ -73,6 +81,8 @@ const configSchema = z
     GOOGLE_CLIENT_SECRET: optionalString,
     GOOGLE_REDIRECT_URI: z.preprocess(emptyStringToUndefined, z.string().url().optional()),
     ENCRYPTION_KEY: z.preprocess(emptyStringToUndefined, z.string().min(32).optional()),
+    WEB_UI_TOKEN: webToken,
+    WEB_OWNER_ID: webOwnerId,
     GEMINI_API_KEY: optionalString,
     GEMINI_MODEL: geminiModel,
     GEMINI_NATURAL_LANGUAGE_ENABLED: booleanFlag(true),
@@ -80,11 +90,14 @@ const configSchema = z
     DAILY_AGENDA_ENABLED: booleanFlag(true),
   })
   .superRefine((value, context) => {
-    if (value.DISCORD_BOT_TOKEN && !value.DISCORD_OWNER_ID) {
+    const localRuntimeValues = [value.DISCORD_BOT_TOKEN, value.DISCORD_OWNER_ID, value.ENCRYPTION_KEY];
+    if (localRuntimeValues.some(Boolean) && !localRuntimeValues.every(Boolean)) {
       context.addIssue({
         code: "custom",
-        message: "DISCORD_OWNER_ID is required when DISCORD_BOT_TOKEN is configured",
-        path: ["DISCORD_OWNER_ID"],
+        message: value.DISCORD_BOT_TOKEN && !value.DISCORD_OWNER_ID
+          ? "DISCORD_OWNER_ID is required when DISCORD_BOT_TOKEN is configured"
+          : "DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY must be configured together",
+        path: [value.DISCORD_BOT_TOKEN && !value.DISCORD_OWNER_ID ? "DISCORD_OWNER_ID" : "ENCRYPTION_KEY"],
       });
     }
 
@@ -97,13 +110,48 @@ const configSchema = z
         path: ["GOOGLE_CLIENT_ID"],
       });
     }
-    const localRuntimeValues = [value.DISCORD_BOT_TOKEN, value.DISCORD_OWNER_ID, value.ENCRYPTION_KEY];
-    if (googleValues.every(Boolean) && !localRuntimeValues.some(Boolean)) {
+    if (googleValues.every(Boolean) && !localRuntimeValues.every(Boolean)) {
       context.addIssue({
         code: "custom",
         message:
           "DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY are required when Google Calendar is configured",
         path: ["DISCORD_BOT_TOKEN"],
+      });
+    }
+    if (value.WEB_UI_TOKEN && !value.ENCRYPTION_KEY) {
+      context.addIssue({
+        code: "custom",
+        message: "ENCRYPTION_KEY is required when WEB_UI_TOKEN is configured",
+        path: ["ENCRYPTION_KEY"],
+      });
+    }
+    if (value.WEB_UI_TOKEN && !localRuntimeValues.every(Boolean)) {
+      context.addIssue({
+        code: "custom",
+        message: "WEB_UI_TOKEN requires complete Discord and encrypted local runtime",
+        path: ["WEB_UI_TOKEN"],
+      });
+    }
+    if (value.WEB_UI_TOKEN && !googleValues.every(Boolean)) {
+      context.addIssue({
+        code: "custom",
+        message: "WEB_UI_TOKEN requires complete Google Calendar OAuth settings",
+        path: ["WEB_UI_TOKEN"],
+      });
+    }
+    if (value.WEB_OWNER_ID && !value.WEB_UI_TOKEN) {
+      context.addIssue({
+        code: "custom",
+        message: "WEB_OWNER_ID can only be configured with WEB_UI_TOKEN",
+        path: ["WEB_OWNER_ID"],
+      });
+    }
+    if (value.WEB_UI_TOKEN && value.WEB_OWNER_ID && value.DISCORD_OWNER_ID &&
+      value.WEB_OWNER_ID !== value.DISCORD_OWNER_ID) {
+      context.addIssue({
+        code: "custom",
+        message: "WEB_OWNER_ID must match DISCORD_OWNER_ID because the runtime has one owner",
+        path: ["WEB_OWNER_ID"],
       });
     }
 
@@ -130,6 +178,11 @@ export interface GoogleCalendarConfig {
   readonly googleClientId: string;
   readonly googleClientSecret: string;
   readonly googleRedirectUri: string;
+}
+
+export interface WebUiConfig {
+  readonly ownerId: string;
+  readonly token: string;
 }
 
 /** Backwards-compatible full integration shape for callers that require both services. */
@@ -197,6 +250,30 @@ export function getGoogleCalendarConfig(config: AppConfig): GoogleCalendarConfig
     googleClientSecret: config.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: config.GOOGLE_REDIRECT_URI,
   };
+}
+
+/** Returns no web UI when it is omitted, or fails closed for incomplete settings. */
+export function getWebUiConfig(config: AppConfig): WebUiConfig | undefined {
+  if (!config.WEB_UI_TOKEN) {
+    return undefined;
+  }
+  if (!config.ENCRYPTION_KEY) {
+    throw new ConfigurationError("ENCRYPTION_KEY is required when WEB_UI_TOKEN is configured");
+  }
+  if (!config.DISCORD_BOT_TOKEN || !config.DISCORD_OWNER_ID) {
+    throw new ConfigurationError(
+      "WEB_UI_TOKEN requires DISCORD_BOT_TOKEN and DISCORD_OWNER_ID; web-only calendar management is not supported",
+    );
+  }
+  if (!config.GOOGLE_CLIENT_ID || !config.GOOGLE_CLIENT_SECRET || !config.GOOGLE_REDIRECT_URI) {
+    throw new ConfigurationError(
+      "WEB_UI_TOKEN requires complete Google Calendar OAuth settings",
+    );
+  }
+  if (config.WEB_OWNER_ID && config.WEB_OWNER_ID !== config.DISCORD_OWNER_ID) {
+    throw new ConfigurationError("WEB_OWNER_ID must match DISCORD_OWNER_ID because the runtime has one owner");
+  }
+  return { ownerId: config.DISCORD_OWNER_ID, token: config.WEB_UI_TOKEN };
 }
 
 /**

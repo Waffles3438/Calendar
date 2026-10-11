@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { OwnerCommandRouter } from "../src/application/owner-command-router.js";
 import type { OwnerDirectMessage } from "../src/discord/owner-dm-handler.js";
 import type { CalendarGateway } from "../src/google/calendar-api.js";
+import { AppStateRepository } from "../src/persistence/state-repository.js";
 import { ScheduleAssistant, type SchedulePendingStateRepository } from "../src/scheduling/schedule-assistant.js";
 import { SchedulingRepository } from "../src/scheduling/scheduling-repository.js";
 
@@ -592,4 +593,218 @@ it("does not replay cached Gemini interpretations while the rollout is disabled"
   await expect(assistant.handle(message("hello cache"))).resolves.toBe(false);
   expect(schedules.listActiveScheduledItems({ ownerId })).toHaveLength(0);
   schedules.close();
+});
+
+
+describe("ScheduleAssistant named scheduled-reminder deletion", () => {
+  it("reviews only matching scheduled reminders and preserves a same-title legacy task", async () => {
+    const state = new AppStateRepository({ databasePath: ":memory:", encryptionSecret: "s".repeat(48) });
+    const schedules = new SchedulingRepository({ databasePath: ":memory:", encryptionSecret: "t".repeat(48) });
+    const gateway = fakeGateway();
+    const calendarList = vi.spyOn(gateway, "listCalendars");
+    const reminder = schedules.createScheduledItem({
+      dueAt: new Date("2026-08-19T13:00:00.000Z"),
+      id: "named-reminder",
+      kind: "reminder",
+      now,
+      ownerId,
+      scheduledDate: "2026-08-19",
+      timeZone,
+      title: "Play among us",
+    });
+    const legacyTask = state.createLocalTask({
+      dueAt: new Date("2026-08-19T14:00:00.000Z"),
+      id: "same-title-legacy-task",
+      now,
+      ownerId,
+      timeZone,
+      title: "Play among us",
+    });
+    const assistant = new ScheduleAssistant({
+      calendarGateway: gateway,
+      logger,
+      now: () => now,
+      ownerId,
+      schedulingRepository: schedules,
+      stateRepository: state,
+      timeZone,
+    });
+    const request = message("delete the PLAY, among us");
+
+    try {
+      await expect(assistant.handleNaturalLanguageAction(request, {
+        action: "delete_task",
+        scope: "single",
+        selector: { title: "the PLAY, among us" },
+      })).resolves.toBe(true);
+
+      const review = request.replies[0] ?? "";
+      const id = confirmationId(review);
+      const pending = state.getPendingAction({ id, now, ownerId });
+      expect(pending?.payload).toMatchObject({
+        calendarEvents: [],
+        cleanupScope: "unscoped_future",
+        items: [{ expectedRevision: reminder.revision, id: reminder.id }],
+        kind: "schedule_cleanup",
+        legacyItems: [],
+        responseSource: "gemini",
+        series: [],
+      });
+      expect(calendarList).not.toHaveBeenCalled();
+      expect(schedules.getScheduledItem({ id: reminder.id, ownerId })).toMatchObject({ status: "active", revision: 1 });
+      expect(state.getLocalTask({ id: legacyTask.id, ownerId })).toMatchObject({ status: "active", revision: 1 });
+
+      await assistant.handlePendingAction(message(`confirm ${id}`), { actionId: id, kind: "confirm" });
+
+      expect(schedules.getScheduledItem({ id: reminder.id, ownerId })).toMatchObject({ status: "cancelled", revision: 2 });
+      expect(state.getLocalTask({ id: legacyTask.id, ownerId })).toMatchObject({ status: "active", revision: 1 });
+    } finally {
+      calendarList.mockRestore();
+      schedules.close();
+      state.close();
+    }
+  });
+
+  it("includes every date-scoped matching reminder, including one that is no longer future", async () => {
+    const schedules = new SchedulingRepository({ databasePath: ":memory:", encryptionSecret: "u".repeat(48) });
+    const pending = new Map<string, unknown>();
+    const state: SchedulePendingStateRepository = {
+      consumePendingAction: ({ id }) => {
+        const payload = pending.get(id);
+        pending.delete(id);
+        return payload === undefined ? undefined : { payload };
+      },
+      createPendingAction: ({ id, payload }) => pending.set(id, payload),
+      getPendingAction: ({ id }) => {
+        const payload = pending.get(id);
+        return payload === undefined ? undefined : { payload };
+      },
+    };
+    const past = schedules.createScheduledItem({
+      dueAt: new Date("2026-08-18T10:00:00.000Z"),
+      id: "date-scoped-past",
+      kind: "reminder",
+      now,
+      ownerId,
+      scheduledDate: "2026-08-18",
+      timeZone,
+      title: "Play among us",
+    });
+    const future = schedules.createScheduledItem({
+      dueAt: new Date("2026-08-18T13:00:00.000Z"),
+      id: "date-scoped-future",
+      kind: "reminder",
+      now,
+      ownerId,
+      scheduledDate: "2026-08-18",
+      timeZone,
+      title: "Play among us tonight",
+    });
+    const unrelated = schedules.createScheduledItem({
+      dueAt: new Date("2026-08-19T13:00:00.000Z"),
+      id: "date-scoped-unrelated",
+      kind: "reminder",
+      now,
+      ownerId,
+      scheduledDate: "2026-08-19",
+      timeZone,
+      title: "Play among us tomorrow",
+    });
+    const assistant = new ScheduleAssistant({
+      logger,
+      now: () => now,
+      ownerId,
+      schedulingRepository: schedules,
+      stateRepository: state,
+      timeZone,
+    });
+
+    try {
+      const request = message("delete play, among us on 2026-08-18");
+      await expect(assistant.handleNaturalLanguageAction(request, {
+        action: "delete_task",
+        scope: "single",
+        selector: { date: "2026-08-18", title: "play, among us" },
+      })).resolves.toBe(true);
+
+      const id = confirmationId(request.replies[0] ?? "");
+      const pendingPayload = pending.get(id) as { cleanupScope: string; items: readonly { id: string }[] } | undefined;
+      expect(pendingPayload).toMatchObject({ cleanupScope: "date_scoped" });
+      expect(pendingPayload?.items.map((item) => item.id)).toEqual([past.id, future.id]);
+      expect(schedules.getScheduledItem({ id: past.id, ownerId })).toMatchObject({ status: "active" });
+      expect(schedules.getScheduledItem({ id: future.id, ownerId })).toMatchObject({ status: "active" });
+      expect(schedules.getScheduledItem({ id: unrelated.id, ownerId })).toMatchObject({ status: "active" });
+    } finally {
+      schedules.close();
+    }
+  });
+
+  it("returns false for another owner's matching reminder without creating a review", async () => {
+    const schedules = new SchedulingRepository({ databasePath: ":memory:", encryptionSecret: "v".repeat(48) });
+    const state = new AppStateRepository({ databasePath: ":memory:", encryptionSecret: "w".repeat(48) });
+    const otherOwnerId = "987654321098765432";
+    schedules.createScheduledItem({
+      dueAt: new Date("2026-08-19T13:00:00.000Z"),
+      id: "foreign-reminder",
+      kind: "reminder",
+      now,
+      ownerId: otherOwnerId,
+      scheduledDate: "2026-08-19",
+      timeZone,
+      title: "Play among us",
+    });
+    const assistant = new ScheduleAssistant({
+      logger,
+      now: () => now,
+      ownerId,
+      schedulingRepository: schedules,
+      stateRepository: state,
+      timeZone,
+    });
+
+    try {
+      const request = message("delete play among us");
+      await expect(assistant.handleNaturalLanguageAction(request, {
+        action: "delete_task",
+        scope: "single",
+        selector: { title: "play among us" },
+      })).resolves.toBe(false);
+      expect(request.replies).toEqual([]);
+      expect(schedules.getScheduledItem({ id: "foreign-reminder", ownerId: otherOwnerId })).toMatchObject({ status: "active" });
+    } finally {
+      schedules.close();
+      state.close();
+    }
+  });
+
+  it("fails closed when the scheduled-reminder preflight cannot read the repository", async () => {
+    const schedules = new SchedulingRepository({ databasePath: ":memory:", encryptionSecret: "x".repeat(48) });
+    const state = new AppStateRepository({ databasePath: ":memory:", encryptionSecret: "y".repeat(48) });
+    const ensureOccurrences = vi.spyOn(schedules, "ensureOccurrencesThrough").mockImplementation(() => {
+      throw new Error("repository unavailable");
+    });
+    const assistant = new ScheduleAssistant({
+      logger,
+      now: () => now,
+      ownerId,
+      schedulingRepository: schedules,
+      stateRepository: state,
+      timeZone,
+    });
+
+    try {
+      const request = message("delete play among us");
+      await expect(assistant.handleNaturalLanguageAction(request, {
+        action: "delete_task",
+        scope: "single",
+        selector: { title: "play among us" },
+      })).resolves.toBe(true);
+      expect(request.replies).toEqual([expect.stringMatching(/safely review every matching scheduled item/i)]);
+      expect(state.getPendingAction({ id: "missing", now, ownerId })).toBeUndefined();
+    } finally {
+      ensureOccurrences.mockRestore();
+      schedules.close();
+      state.close();
+    }
+  });
 });

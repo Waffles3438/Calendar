@@ -1,4 +1,5 @@
 import type { CalendarMessageHandler } from "./calendar-assistant.js";
+import type { CalendarManagementAssistant } from "./calendar-management-assistant.js";
 import { markGeminiResponseUsed, withGeminiResponseAttribution } from "./gemini-response-attribution.js";
 import {
   parsePendingActionInstruction,
@@ -32,6 +33,13 @@ interface RoutedMessageHandler extends CalendarMessageHandler, Partial<PendingAc
   ) => Promise<void>;
 }
 
+interface NamedDeleteMessageHandler extends PendingActionMessageHandler {
+  handleNaturalLanguageAction(
+    message: OwnerDirectMessage,
+    action: Extract<NaturalLanguageAction, { action: "delete_task" }>,
+  ): Promise<void>;
+}
+
 interface LocalTaskMessageHandler extends PendingActionMessageHandler {
   handle(message: OwnerDirectMessage): Promise<void>;
   handleNaturalLanguage(message: OwnerDirectMessage): Promise<void>;
@@ -49,7 +57,7 @@ interface ScheduleMessageHandler extends PendingActionMessageHandler {
   handleNaturalLanguageAction?: (
     message: OwnerDirectMessage,
     action: Extract<NaturalLanguageAction, {
-      action: "cleanup_schedule" | "create_calendar_event" | "create_task_or_reminder" | "show_agenda";
+      action: "cleanup_schedule" | "create_calendar_event" | "create_task_or_reminder" | "delete_task" | "show_agenda";
     }>,
   ) => Promise<boolean>;
 }
@@ -73,9 +81,11 @@ interface RouterStateRepository {
 
 export interface OwnerCommandRouterOptions {
   readonly calendarAssistant?: RoutedMessageHandler;
+  readonly calendarManagementAssistant?: CalendarManagementAssistant;
   readonly calendarReader?: CalendarReader;
   readonly geminiResponseLabelEnabled?: boolean;
   readonly localTaskAssistant?: LocalTaskMessageHandler;
+  readonly namedDeleteHandler?: NamedDeleteMessageHandler;
   readonly naturalLanguageClassifier?: NaturalLanguageDomainClassifier;
   readonly naturalLanguagePlanner?: NaturalLanguageActionPlanner;
   readonly oauthService?: {
@@ -93,6 +103,9 @@ export class OwnerCommandRouter {
   public constructor(private readonly options: OwnerCommandRouterOptions) { }
 
   public async handle(message: OwnerDirectMessage): Promise<void> {
+    if (message.authorId !== this.options.ownerId) {
+      return;
+    }
     const routedMessage = withGeminiResponseAttribution(
       message,
       this.options.geminiResponseLabelEnabled ?? true,
@@ -130,6 +143,15 @@ export class OwnerCommandRouter {
 
     if (command === "/status" || command === "status") {
       await this.replyWithStatus(routedMessage);
+      return;
+    }
+
+    if (isCalendarManagementCommand(routedMessage.content)) {
+      if (this.options.calendarManagementAssistant) {
+        await this.options.calendarManagementAssistant.handle(routedMessage);
+      } else {
+        await routedMessage.reply("Google Calendar management is not configured for this bot.");
+      }
       return;
     }
 
@@ -204,8 +226,10 @@ export class OwnerCommandRouter {
     }
 
     const handlers: readonly (PendingActionMessageHandler | undefined)[] = [
+      this.options.namedDeleteHandler,
       this.options.scheduleAssistant,
       this.options.localTaskAssistant,
+      this.options.calendarManagementAssistant,
       this.options.calendarAssistant &&
         typeof this.options.calendarAssistant.canHandlePendingAction === "function" &&
         typeof this.options.calendarAssistant.handlePendingAction === "function"
@@ -333,13 +357,34 @@ export class OwnerCommandRouter {
         return;
       case "list_tasks":
       case "complete_task":
-      case "delete_task":
         if (this.options.localTaskAssistant?.handleNaturalLanguageAction) {
           await this.options.localTaskAssistant.handleNaturalLanguageAction(message, action);
         } else {
           await message.reply("Local task support is not configured for this bot.");
         }
         return;
+      case "delete_task": {
+        const isSingleNamedDelete = action.scope === "single" && Boolean(action.selector?.title.trim());
+        if (isSingleNamedDelete && this.options.namedDeleteHandler) {
+          // Resolve across every configured deletion domain before selecting an
+          // exact adapter. Scheduling remains the fallback only when the
+          // cross-domain coordinator is unavailable.
+          await this.options.namedDeleteHandler.handleNaturalLanguageAction(message, action);
+          return;
+        }
+        if (isSingleNamedDelete && this.options.scheduleAssistant?.handleNaturalLanguageAction) {
+          const handled = await this.options.scheduleAssistant.handleNaturalLanguageAction(message, action);
+          if (handled) {
+            return;
+          }
+        }
+        if (this.options.localTaskAssistant?.handleNaturalLanguageAction) {
+          await this.options.localTaskAssistant.handleNaturalLanguageAction(message, action);
+        } else {
+          await message.reply("Local task support is not configured for this bot.");
+        }
+        return;
+      }
       case "show_agenda":
       case "cleanup_schedule":
         if (this.options.scheduleAssistant?.handleNaturalLanguageAction) {
@@ -414,7 +459,18 @@ export class OwnerCommandRouter {
       return;
     }
 
-    if (!this.options.stateRepository.getGoogleOAuth()) {
+    let googleCredentials: GoogleOAuthCredentials | undefined;
+    try {
+      googleCredentials = this.options.stateRepository.getGoogleOAuth();
+    } catch {
+      status.push(
+        "Google Calendar is linked, but I could not read its current status. Try /connect again if this persists.",
+      );
+      await message.reply(status.join(" "));
+      return;
+    }
+
+    if (!googleCredentials) {
       status.push("Google Calendar is not connected. Send /connect to link it.");
       await message.reply(status.join(" "));
       return;
@@ -455,4 +511,8 @@ function naturalLanguageClarificationMessage(reason: NaturalLanguageClarificatio
     case "unsupported_intent":
       return "I can currently manage Calendar events and one-time local tasks, but not that kind of request.";
   }
+}
+
+function isCalendarManagementCommand(content: string): boolean {
+  return /^(?:calendars|list\s+calendars|(?:add|create)\s+calendar|edit\s+calendar|show\s+calendar|hide\s+calendar|(?:delete|remove)\s+calendar|resume\s+calendar\s+migration)\b/iu.test(content.trim());
 }

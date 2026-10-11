@@ -8,6 +8,7 @@ import {
   parsePendingActionInstruction,
 } from "../application/pending-action.js";
 import { markGeminiResponseUsed } from "../application/gemini-response-attribution.js";
+import type { LegacyTaskCandidate } from "../application/named-delete-resolver.js";
 import { formatDiscordDate } from "../discord/discord-timestamp.js";
 import type { OwnerDirectMessage } from "../discord/owner-dm-handler.js";
 import type { NaturalLanguageAction } from "../nlp/natural-language-action.js";
@@ -34,6 +35,7 @@ import {
   localTaskDateBounds,
   validateLocalTaskDateTime,
 } from "./task-time.js";
+import { normalizeTaskSelectorTerms, titleMatchesTaskSelector } from "./task-selector.js";
 
 export interface LocalTaskStateRepository {
   cancelLocalTask(input: LocalTaskTransitionInput): LocalTask | undefined;
@@ -242,7 +244,10 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
         return;
       case "delete_task":
         if (action.scope === "single" && action.selector) {
-          await this.handleTransitionCommand(message, "cancel", toLocalTaskSelector(action.selector), "gemini");
+          await this.handleTransitionCommand(message, "cancel", toLocalTaskSelector({
+            date: action.selector.date ?? action.date,
+            title: action.selector.title,
+          }), "gemini");
           return;
         }
         if (action.scope === "today" && action.date) {
@@ -252,6 +257,14 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
         await this.handleBulkCancellation(message, undefined, false, "gemini");
         return;
     }
+  }
+
+  /** Applies a resolver-captured task identity without running a second title search. */
+  public async handleResolvedNamedCancellation(
+    message: OwnerDirectMessage,
+    candidate: LegacyTaskCandidate,
+  ): Promise<void> {
+    await this.executeTransition(message, "cancel", candidate.taskId, candidate.expectedRevision);
   }
 
   private async handleMessage(
@@ -808,12 +821,12 @@ export class LocalTaskAssistant implements PendingActionMessageHandler {
   }
 
   private findMatchingTasks(selector: LocalTaskSelector): readonly LocalTask[] {
-    const terms = titleTerms(selector.title);
+    const terms = normalizeTaskSelectorTerms(selector.title);
     return this.options.stateRepository
       .listActiveLocalTasks({ ownerId: this.options.ownerId })
       .filter((task) =>
         (!selector.date || localTaskDate(task.dueAt, task.timeZone) === selector.date) &&
-        terms.every((term) => task.title.toLocaleLowerCase().includes(term)),
+        titleMatchesTaskSelector(task.title, terms),
       );
   }
 
@@ -847,13 +860,4 @@ function toLocalTaskSelector(selector: { readonly date?: string | undefined; rea
     ...(selector.date ? { date: selector.date } : {}),
     title: selector.title,
   };
-}
-
-function titleTerms(value: string): readonly string[] {
-  const generic = new Set(["a", "an", "task", "the", "to"]);
-  const terms = value
-    .toLocaleLowerCase()
-    .split(/[^\p{L}\p{N}]+/u)
-    .filter((term) => term.length > 0 && !generic.has(term));
-  return terms.length > 0 ? terms : [value.toLocaleLowerCase()];
 }

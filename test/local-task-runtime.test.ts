@@ -31,8 +31,10 @@ describe("local task runtime configuration", () => {
   });
 
   it("fails closed when the local runtime is incomplete", () => {
-    const config = loadConfig({ DISCORD_OWNER_ID: ownerId, ENCRYPTION_KEY: "x".repeat(48) });
-    expect(() => getLocalBotConfig(config)).toThrow(/DISCORD_BOT_TOKEN/u);
+    expect(() => loadConfig({
+      DISCORD_OWNER_ID: ownerId,
+      ENCRYPTION_KEY: "x".repeat(48),
+    })).toThrow(/DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY must be configured together/u);
   });
 });
 

@@ -232,6 +232,47 @@ const MIGRATIONS: readonly Migration[] = [
         ON natural_language_context(expires_at);
     `,
   },
+  {
+    version: 8,
+    sql: `
+      CREATE TABLE IF NOT EXISTS calendar_migration_jobs (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        source_calendar_id TEXT NOT NULL,
+        destination_calendar_id TEXT NOT NULL,
+        source_calendar_name TEXT NOT NULL,
+        destination_calendar_name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS calendar_migration_jobs_owner_index
+        ON calendar_migration_jobs(owner_id, updated_at);
+
+      CREATE TABLE IF NOT EXISTS calendar_migration_events (
+        job_id TEXT NOT NULL REFERENCES calendar_migration_jobs(id) ON DELETE CASCADE,
+        source_event_id TEXT NOT NULL,
+        destination_event_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'moved', 'failed', 'unsupported')),
+        failure_reason TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(job_id, source_event_id)
+      );
+      CREATE INDEX IF NOT EXISTS calendar_migration_events_status_index
+        ON calendar_migration_events(job_id, status);
+
+      CREATE TABLE IF NOT EXISTS web_sessions (
+        token_hash TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        csrf_token_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS web_sessions_expiry_index ON web_sessions(expires_at);
+    `,
+  },
 ];
 
 export class SqliteStore {

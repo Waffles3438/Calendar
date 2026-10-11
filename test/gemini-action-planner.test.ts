@@ -73,6 +73,8 @@ describe("GeminiActionPlanner", () => {
     expect(client.calls[0]?.request).not.toHaveProperty("tools");
     expect(client.calls[0]?.options).toEqual({ timeout_ms: GEMINI_REQUEST_TIMEOUT_MILLISECONDS });
     expect(String(client.calls[0]?.request.system_instruction)).toContain("delete_task");
+    expect(String(client.calls[0]?.request.system_instruction)).toContain("scheduled reminders first");
+    expect(String(client.calls[0]?.request.system_instruction)).toContain("delete_calendar_event");
     expect(String(client.calls[0]?.request.input)).toContain(input.text);
     expect(String(client.calls[0]?.request.input)).toContain(input.timeZone);
   });

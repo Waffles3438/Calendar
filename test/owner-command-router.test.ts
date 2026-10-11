@@ -41,6 +41,66 @@ describe("OwnerCommandRouter", () => {
     expect(input.replies).toEqual([expect.stringContaining("https://accounts.example.test/auth")]);
   });
 
+  it("reports Google as unconfigured when no Calendar integration is wired", async () => {
+    const router = new OwnerCommandRouter({
+      ownerId: "123456789012345678",
+      stateRepository: {},
+    });
+    const input = message("status");
+
+    await router.handle(input);
+
+    expect(input.replies).toEqual(["Google Calendar is not configured."]);
+  });
+
+  it("reports a disconnected Google account when no credential is stored", async () => {
+    const router = new OwnerCommandRouter({
+      calendarReader: { listCalendars: async (): Promise<readonly CalendarReference[]> => [] },
+      oauthService: { beginAuthorization: () => ({ authorizationUrl: "unused", state: "unused" }) },
+      ownerId: "123456789012345678",
+      stateRepository: { getGoogleOAuth: vi.fn(() => undefined) },
+    });
+    const input = message("status");
+
+    await router.handle(input);
+
+    expect(input.replies).toEqual(["Google Calendar is not connected. Send /connect to link it."]);
+  });
+
+  it("reports a connected account without a primary calendar safely", async () => {
+    const router = new OwnerCommandRouter({
+      calendarReader: { listCalendars: async (): Promise<readonly CalendarReference[]> => [] },
+      oauthService: { beginAuthorization: () => ({ authorizationUrl: "unused", state: "unused" }) },
+      ownerId: "123456789012345678",
+      stateRepository: { getGoogleOAuth: vi.fn(() => ({ accessToken: "token", refreshToken: "refresh" })) },
+    });
+    const input = message("status");
+
+    await router.handle(input);
+
+    expect(input.replies).toEqual(["Google Calendar is connected, but no primary calendar was available."]);
+  });
+
+  it("reports a safe status when the Calendar read fails", async () => {
+    const router = new OwnerCommandRouter({
+      calendarReader: {
+        listCalendars: async (): Promise<readonly CalendarReference[]> => {
+          throw new Error("Google unavailable");
+        }
+      },
+      oauthService: { beginAuthorization: () => ({ authorizationUrl: "unused", state: "unused" }) },
+      ownerId: "123456789012345678",
+      stateRepository: { getGoogleOAuth: vi.fn(() => ({ accessToken: "token", refreshToken: "refresh" })) },
+    });
+    const input = message("status");
+
+    await router.handle(input);
+
+    expect(input.replies).toEqual([
+      "Google Calendar is linked, but I could not read its current status. Try /connect again if this persists.",
+    ]);
+  });
+
   it("reports the connected primary calendar through the status command", async () => {
     const router = new OwnerCommandRouter({
       calendarReader: {
@@ -66,6 +126,26 @@ describe("OwnerCommandRouter", () => {
     await router.handle(input);
 
     expect(input.replies).toEqual([expect.stringContaining("America/Chicago")]);
+  });
+
+  it("returns a safe status when stored Google credentials cannot be read", async () => {
+    const router = new OwnerCommandRouter({
+      calendarReader: { listCalendars: async (): Promise<readonly CalendarReference[]> => [] },
+      oauthService: { beginAuthorization: () => ({ authorizationUrl: "unused", state: "unused" }) },
+      ownerId: "123456789012345678",
+      stateRepository: {
+        getGoogleOAuth: () => {
+          throw new Error("Stored Google OAuth credentials are invalid");
+        },
+      },
+    });
+    const input = message("status");
+
+    await router.handle(input);
+
+    expect(input.replies).toEqual([
+      expect.stringContaining("I could not read its current status"),
+    ]);
   });
 
   it("notifies Calendar-dependent caches after a successful disconnect", async () => {

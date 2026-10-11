@@ -49,7 +49,7 @@ const SYSTEM_INSTRUCTION = [
   "A calendar selector must include a date and a title or time. A task selector must include a title.",
   "Use create_task_or_reminder for private local tasks and reminders; use create_calendar_event for Google Calendar events.",
   "Use show_agenda for broad daily-plan, day, or agenda requests such as 'What do I need to do today?' or 'What is on my day today?'. For a single day, set date and endDate to the same supplied local date and use range=day. Use list_tasks only when the owner explicitly asks for tasks, a to-do list, or local tasks.",
-  "For delete_task, use scope=all for 'delete all tasks' and always leave confirmation to the application. Use scope=today for 'delete all tasks for today'; the application considers only future tasks today and confirms only when more than one matches. Use scope=single for 'delete task ...'; the application selects or executes locally and never guesses among multiple matches.",
+  "For delete_task, use scope=all for 'delete all tasks' and always leave confirmation to the application. Use scope=today for 'delete all tasks for today'; the application considers only future tasks today and confirms only when more than one matches. Use scope=single with a title for one named private task or reminder; the application resolves scheduled reminders first and legacy local tasks as fallback. Use delete_calendar_event for explicit Calendar selectors; bulk scopes remain local-only.",
   "Do not return IDs, ETags, URLs, calendar identifiers, credentials, API bodies, tools, function calls, confidence values, or policy decisions.",
   "Examples:",
   ACTION_EXAMPLES,

@@ -155,4 +155,128 @@ describe("unified owner routing", () => {
     expect(local.handle).toHaveBeenCalledTimes(1);
     expect(local.handleNaturalLanguage).not.toHaveBeenCalled();
   });
+
+  it.each([
+    {
+      action: { action: "delete_task", date: "2026-08-18", scope: "today" } as const,
+      label: "today",
+    },
+    {
+      action: { action: "delete_task", scope: "all" } as const,
+      label: "all",
+    },
+  ])("routes $label delete_task directly to the legacy assistant", async ({ action }) => {
+    const local = taskHandler();
+    const schedule = {
+      canHandlePendingAction: () => false,
+      handle: vi.fn(async () => false),
+      handleNaturalLanguageAction: vi.fn(async () => true),
+      handlePendingAction: vi.fn(async () => false),
+    };
+    const router = new OwnerCommandRouter({
+      localTaskAssistant: local,
+      naturalLanguagePlanner: { plan: vi.fn(async () => action) },
+      ownerId,
+      scheduleAssistant: schedule,
+      stateRepository: {},
+    });
+
+    await router.handle(message(`delete ${action.scope}`));
+
+    expect(schedule.handleNaturalLanguageAction).not.toHaveBeenCalled();
+    expect(local.handleNaturalLanguageAction).toHaveBeenCalledTimes(1);
+    expect(local.handleNaturalLanguageAction).toHaveBeenCalledWith(expect.anything(), action);
+  });
+});
+
+
+describe("unified named delete scheduling probe", () => {
+  it("tries scheduling first and falls back to the legacy assistant exactly once when unhandled", async () => {
+    const local = taskHandler();
+    const schedule = {
+      canHandlePendingAction: () => false,
+      handle: vi.fn(async () => false),
+      handleNaturalLanguageAction: vi.fn(async () => false),
+      handlePendingAction: vi.fn(async () => false),
+    };
+    const action = {
+      action: "delete_task" as const,
+      scope: "single" as const,
+      selector: { title: "call plumber" },
+    };
+    const router = new OwnerCommandRouter({
+      localTaskAssistant: local,
+      naturalLanguagePlanner: { plan: vi.fn(async () => action) },
+      ownerId,
+      scheduleAssistant: schedule,
+      stateRepository: {},
+    });
+    const input = message("delete call plumber");
+
+    await router.handle(input);
+
+    expect(schedule.handleNaturalLanguageAction).toHaveBeenCalledTimes(1);
+    expect(schedule.handleNaturalLanguageAction).toHaveBeenCalledWith(expect.objectContaining({ content: input.content }), action);
+    expect(local.handleNaturalLanguageAction).toHaveBeenCalledTimes(1);
+    expect(local.handleNaturalLanguageAction).toHaveBeenCalledWith(expect.objectContaining({ content: input.content }), action);
+  });
+
+  it("prefers centralized named-delete resolution when scheduling is also configured", async () => {
+    const local = taskHandler();
+    const schedule = {
+      canHandlePendingAction: () => false,
+      handle: vi.fn(async () => false),
+      handleNaturalLanguageAction: vi.fn(async () => true),
+      handlePendingAction: vi.fn(async () => false),
+    };
+    const namedDelete = taskHandler({
+      handleNaturalLanguageAction: vi.fn(async () => undefined),
+    });
+    const action = {
+      action: "delete_task" as const,
+      scope: "single" as const,
+      selector: { title: "play among us" },
+    };
+    const router = new OwnerCommandRouter({
+      localTaskAssistant: local,
+      namedDeleteHandler: namedDelete,
+      naturalLanguagePlanner: { plan: vi.fn(async () => action) },
+      ownerId,
+      scheduleAssistant: schedule,
+      stateRepository: {},
+    });
+
+    await router.handle(message("delete play among us"));
+
+    expect(namedDelete.handleNaturalLanguageAction).toHaveBeenCalledTimes(1);
+    expect(schedule.handleNaturalLanguageAction).not.toHaveBeenCalled();
+    expect(local.handleNaturalLanguageAction).not.toHaveBeenCalled();
+  });
+
+  it("stops after a handled scheduled-reminder deletion and never invokes the legacy assistant", async () => {
+    const local = taskHandler();
+    const schedule = {
+      canHandlePendingAction: () => false,
+      handle: vi.fn(async () => false),
+      handleNaturalLanguageAction: vi.fn(async () => true),
+      handlePendingAction: vi.fn(async () => false),
+    };
+    const action = {
+      action: "delete_task" as const,
+      scope: "single" as const,
+      selector: { title: "play among us" },
+    };
+    const router = new OwnerCommandRouter({
+      localTaskAssistant: local,
+      naturalLanguagePlanner: { plan: vi.fn(async () => action) },
+      ownerId,
+      scheduleAssistant: schedule,
+      stateRepository: {},
+    });
+
+    await router.handle(message("delete play among us"));
+
+    expect(schedule.handleNaturalLanguageAction).toHaveBeenCalledTimes(1);
+    expect(local.handleNaturalLanguageAction).not.toHaveBeenCalled();
+  });
 });

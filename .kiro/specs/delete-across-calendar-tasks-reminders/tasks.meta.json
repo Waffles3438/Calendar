@@ -1,0 +1,114 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. **Property 1: Bug Condition** - Reproduce incomplete cross-domain named-delete resolution": [
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442621819
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442627071
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442857922
+      }
+    ],
+    "2. **Property 2: Preservation** - Capture non-buggy behavior before implementation": [
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442621897
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442862222
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787443249436
+      }
+    ],
+    "3.1 Implement the coordinator, exact-target adapters, routing, wiring, and focused coverage": [
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442621990
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787443252577
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444167952
+      }
+    ],
+    "3.2 **Property 1: Expected Behavior** - Re-run the bug-condition tests after the fix": [
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442622032
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444173142
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444224923
+      }
+    ],
+    "3.3 **Property 2: Preservation** - Re-run the preservation tests after the fix": [
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442622083
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444228254
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444284390
+      }
+    ],
+    "4. Checkpoint - Run targeted and full validation": [
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787442622132
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444287428
+      },
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444380789
+      }
+    ],
+    "3. Implement complete owner-scoped named-delete resolution and safe exact routing": [
+      {
+        "executionId": "2f28258b-09de-4499-b670-c5df5868d5f2",
+        "chatSessionId": "sess_dd7483e9-13d3-4fdc-a1a8-49e8a2757149",
+        "timestamp": 1787444284435
+      }
+    ]
+  }
+}

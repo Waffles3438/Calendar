@@ -4,6 +4,7 @@ import {
   ConfigurationError,
   getBotIntegrationConfig,
   getGeminiFallbackConfig,
+  getWebUiConfig,
   loadConfig,
 } from "../src/config.js";
 
@@ -45,15 +46,21 @@ describe("loadConfig", () => {
     })).toThrow(/DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY are required/u);
   });
 
-  it("fails closed when the persisted bot integration is incomplete", () => {
-    const partial = loadConfig({
+  it("fails closed when the local runtime is incomplete", () => {
+    expect(() => loadConfig({
       DISCORD_BOT_TOKEN: "token",
       DISCORD_OWNER_ID: "123456789012345678",
       GOOGLE_CLIENT_ID: "client-id",
       GOOGLE_CLIENT_SECRET: "client-secret",
       GOOGLE_REDIRECT_URI: "https://calendar.example.com/oauth/google/callback",
-    });
-    expect(() => getBotIntegrationConfig(partial)).toThrow(/ENCRYPTION_KEY/);
+    })).toThrow(/ENCRYPTION_KEY/);
+
+    expect(() => loadConfig({
+      ENCRYPTION_KEY: "x".repeat(48),
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_REDIRECT_URI: "https://calendar.example.com/oauth/google/callback",
+    })).toThrow(/DISCORD_BOT_TOKEN, DISCORD_OWNER_ID, and ENCRYPTION_KEY are required/u);
 
     const complete = loadConfig({
       DISCORD_BOT_TOKEN: "token",
@@ -67,6 +74,50 @@ describe("loadConfig", () => {
     expect(getBotIntegrationConfig(complete)).toMatchObject({
       discordOwnerId: "123456789012345678",
       googleRedirectUri: "https://calendar.example.com/oauth/google/callback",
+    });
+  });
+
+  it("requires the full Discord and Google runtime for the browser panel", () => {
+    const token = "w".repeat(32);
+    const google = {
+      GOOGLE_CLIENT_ID: "client-id",
+      GOOGLE_CLIENT_SECRET: "client-secret",
+      GOOGLE_REDIRECT_URI: "https://calendar.example.com/oauth/google/callback",
+    };
+
+    expect(() => loadConfig({
+      ENCRYPTION_KEY: "x".repeat(48),
+      WEB_OWNER_ID: "123456789012345678",
+      WEB_UI_TOKEN: token,
+    })).toThrow(/WEB_UI_TOKEN requires complete Discord/u);
+
+    expect(() => loadConfig({
+      DISCORD_BOT_TOKEN: "discord-token",
+      DISCORD_OWNER_ID: "123456789012345678",
+      ENCRYPTION_KEY: "x".repeat(48),
+      WEB_UI_TOKEN: token,
+    })).toThrow(/WEB_UI_TOKEN requires complete Google/u);
+
+    expect(() => loadConfig({
+      ...google,
+      DISCORD_BOT_TOKEN: "discord-token",
+      DISCORD_OWNER_ID: "123456789012345678",
+      ENCRYPTION_KEY: "x".repeat(48),
+      WEB_OWNER_ID: "999999999999999999",
+      WEB_UI_TOKEN: token,
+    })).toThrow(/WEB_OWNER_ID must match DISCORD_OWNER_ID/u);
+
+    const config = loadConfig({
+      ...google,
+      DISCORD_BOT_TOKEN: "discord-token",
+      DISCORD_OWNER_ID: "123456789012345678",
+      ENCRYPTION_KEY: "x".repeat(48),
+      WEB_OWNER_ID: "123456789012345678",
+      WEB_UI_TOKEN: token,
+    });
+    expect(getWebUiConfig(config)).toEqual({
+      ownerId: "123456789012345678",
+      token,
     });
   });
 });

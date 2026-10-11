@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  GOOGLE_CALENDAR_SCOPES,
+  GoogleApiOAuthProvider,
   GoogleOAuthService,
   OAuthStateError,
   type GoogleOAuthProvider,
@@ -34,6 +36,51 @@ describe("GoogleOAuthService", () => {
     });
     return repository;
   }
+
+  it("requests the management scopes with offline incremental consent", () => {
+    const provider = new GoogleApiOAuthProvider({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      redirectUri: "https://calendar.example.com/oauth/google/callback",
+    });
+
+    const authorizationUrl = new URL(provider.createAuthorizationUrl("state-value"));
+    expect(authorizationUrl.searchParams.get("access_type")).toBe("offline");
+    expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBe("true");
+    expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
+    expect(authorizationUrl.searchParams.get("state")).toBe("state-value");
+    expect(authorizationUrl.searchParams.get("scope")?.split(" ")).toEqual([...GOOGLE_CALENDAR_SCOPES]);
+  });
+
+  it("preserves an existing refresh token when Google omits it", async () => {
+    const state = await createRepository();
+    state.saveGoogleOAuth({
+      accessToken: "old-access-token",
+      expiresAt: "2026-08-15T13:00:00.000Z",
+      refreshToken: "existing-refresh-token",
+    });
+    const provider: GoogleOAuthProvider = {
+      createAuthorizationUrl: (oauthState) => oauthState,
+      exchangeAuthorizationCode: async () => ({
+        accessToken: "new-access-token",
+        expiresAt: "2026-08-15T14:00:00.000Z",
+      }),
+    };
+    const service = new GoogleOAuthService({
+      now: () => now,
+      provider,
+      randomState: () => "state-preserve-refresh-token",
+      stateRepository: state,
+    });
+
+    const authorization = service.beginAuthorization("123456789012345678");
+    await service.completeAuthorization({ code: "authorization-code", state: authorization.state });
+
+    expect(state.getGoogleOAuth()).toMatchObject({
+      accessToken: "new-access-token",
+      refreshToken: "existing-refresh-token",
+    });
+  });
 
   it("creates a one-time state token and stores credentials after a valid callback", async () => {
     const state = await createRepository();

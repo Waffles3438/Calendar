@@ -7,6 +7,11 @@ import type {
   PendingActionMessageHandler,
 } from "./pending-action.js";
 import { markGeminiResponseUsed } from "./gemini-response-attribution.js";
+import {
+  isNamedDeleteCalendarEventForDate,
+  isNamedDeleteCalendarEventFuture,
+  type CalendarEventCandidate,
+} from "./named-delete-resolver.js";
 
 import {
   calendarDateTimeToDateTime,
@@ -103,6 +108,7 @@ type TargetedCommand = Extract<
 >;
 type MutationCommand = Exclude<TargetedCommand, { readonly kind: "set_reminder" }>;
 type MutationOperation = "delete" | "manage_attendees" | "update";
+type MutationExecutionIntent = "exactPrivateNamedDelete";
 
 interface CandidateSearchResult {
   readonly candidates: readonly CalendarEvent[];
@@ -145,6 +151,9 @@ interface PendingMutation {
   readonly expectedEtag: string;
   readonly expectedMasterEtag?: string;
   readonly kind: "mutation";
+  readonly namedDelete?: true;
+  readonly namedDeleteDate?: string;
+  readonly namedDeleteFutureOnly?: true;
   readonly newStartTime?: string;
   readonly operation: MutationOperation;
   readonly recurrenceScope?: RecurrenceScope;
@@ -282,8 +291,13 @@ function isPendingMutation(value: unknown): value is PendingMutation {
     ((value.recurrenceScope === "all_future" || value.recurrenceScope === "series")
       ? typeof value.expectedMasterEtag === "string" && value.expectedMasterEtag.trim().length > 0
       : !("expectedMasterEtag" in value) || value.expectedMasterEtag === undefined) &&
-    (!("newStartTime" in value) || value.newStartTime === undefined || typeof value.newStartTime === "string") &&
-    (!("attendeeChange" in value) || value.attendeeChange === undefined || isAttendeeChange(value.attendeeChange))
+    (!(["newStartTime"] as const).some((key) => key in value) || value.newStartTime === undefined || typeof value.newStartTime === "string") &&
+    (!(["attendeeChange"] as const).some((key) => key in value) || value.attendeeChange === undefined || isAttendeeChange(value.attendeeChange)) &&
+    (!(["namedDelete"] as const).some((key) => key in value) || value.namedDelete === undefined || value.namedDelete === true) &&
+    (!(["namedDeleteDate"] as const).some((key) => key in value) || value.namedDeleteDate === undefined || typeof value.namedDeleteDate === "string") &&
+    (!(["namedDeleteFutureOnly"] as const).some((key) => key in value) || value.namedDeleteFutureOnly === undefined || value.namedDeleteFutureOnly === true) &&
+    (!(value.namedDeleteDate !== undefined && value.namedDeleteFutureOnly === true)) &&
+    (!value.namedDelete || value.operation === "delete")
   );
 }
 
@@ -331,6 +345,21 @@ function hasUsableEtag(event: CalendarEvent): boolean {
 
 function sameWarnings(first: readonly SafetyWarning[], second: readonly SafetyWarning[]): boolean {
   return first.length === second.length && first.every((warning) => second.includes(warning));
+}
+
+function calendarEventFromNamedCandidate(candidate: CalendarEventCandidate): CalendarEvent {
+  return {
+    attendees: candidate.hasExternalGuests ? [{ email: "external-guest@example.invalid" }] : [],
+    calendarId: candidate.calendarId,
+    end: candidate.end,
+    etag: candidate.expectedEtag,
+    id: candidate.eventId,
+    ...(candidate.recurrence ? { recurrence: candidate.recurrence } : {}),
+    ...(candidate.recurringEventId ? { recurringEventId: candidate.recurringEventId } : {}),
+    start: candidate.start,
+    status: "confirmed",
+    summary: candidate.summary,
+  };
 }
 
 /** Executes deterministic commands only after calendar safety policy approval. */
@@ -818,6 +847,65 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     await this.executeMutation(message, mutation, calendar, false);
   }
 
+  /**
+   * Converts one fresh resolver snapshot into the existing Calendar mutation
+   * confirmation. The mutation path still performs the latest event read.
+   */
+  public async handleResolvedNamedDeletion(
+    message: OwnerDirectMessage,
+    candidate: CalendarEventCandidate,
+    selectorDate?: string,
+  ): Promise<void> {
+    const event = calendarEventFromNamedCandidate(candidate);
+    const decision = evaluateMutationSafety({
+      match: { candidateCount: 1, confidence: 0.99 },
+      operation: "delete",
+      proposedByModel: true,
+      target: {
+        hasExternalGuests: candidate.hasExternalGuests,
+        isRecurring: isRecurringEvent(event),
+      },
+    });
+    if (decision.disposition === "require_clarification") {
+      await message.reply(this.clarificationFor(decision));
+      return;
+    }
+    if (decision.disposition !== "require_confirmation") {
+      await message.reply("This action requires confirmation before it can be applied.");
+      return;
+    }
+
+    const mutation: PendingMutation = {
+      calendarId: candidate.calendarId,
+      eventDescription: eventDisplayName(event, candidate.calendarTimeZone),
+      eventId: candidate.eventId,
+      expectedEtag: candidate.expectedEtag,
+      kind: "mutation",
+      namedDelete: true,
+      ...(selectorDate ? { namedDeleteDate: selectorDate } : { namedDeleteFutureOnly: true }),
+      operation: "delete",
+      sendUpdates: candidate.hasExternalGuests ? "all" : "none",
+      source: "gemini",
+      warnings: decision.warnings,
+    };
+    if (!candidate.hasExternalGuests && !isRecurringEvent(event)) {
+      let calendar: CalendarReference;
+      try {
+        calendar = await this.getCalendar(candidate.calendarId);
+      } catch (error: unknown) {
+        this.options.logger.error(
+          { calendarId: candidate.calendarId, error },
+          "Named Calendar deletion access check failed",
+        );
+        await message.reply("I could not safely complete that calendar change. Please review the event and try again.");
+        return;
+      }
+      await this.executeMutation(message, mutation, calendar, false, "exactPrivateNamedDelete");
+      return;
+    }
+    await this.queueConfirmation(message, mutation, decision);
+  }
+
   private async handleConfirmation(message: OwnerDirectMessage, actionId: string): Promise<void> {
     if (this.options.dryRun) {
       await message.reply("Dry run: no calendar change was made.");
@@ -1004,15 +1092,20 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     calendar: CalendarReference,
     selector: EventQuery,
   ): Promise<CandidateSearchResult> {
-    if (!selector.date) {
+    const selectorDate = selector.date;
+    if (!selectorDate) {
       return { candidates: [], confidence: 0 };
     }
 
     const events = await this.options.calendarGateway.listEvents({
       calendarId: calendar.id,
-      ...calendarDayBounds(selector.date, calendar.timeZone),
+      ...calendarDayBounds(selectorDate, calendar.timeZone),
     });
-    let candidates = events.filter((event) => event.status !== "cancelled");
+    let candidates = events
+      .filter((event) => event.status !== "cancelled")
+      // Providers normally honor the requested day range. Keep the local
+      // interval check as a fail-closed guard for stale/overbroad responses.
+      .filter((event) => isNamedDeleteCalendarEventForDate(event, calendar, selectorDate));
     const terms = summaryTerms(selector.summary);
 
     if (selector.time) {
@@ -1121,6 +1214,7 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
     mutation: PendingMutation,
     calendar: CalendarReference,
     confirmationAccepted: boolean,
+    executionIntent?: MutationExecutionIntent,
   ): Promise<void> {
     const auditDetails = { calendarId: mutation.calendarId, eventId: mutation.eventId };
     try {
@@ -1147,6 +1241,14 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
           mutation,
           "That event changed since this action was prepared. Please repeat the request.",
         );
+        return;
+      }
+      if (mutation.namedDeleteDate && !isNamedDeleteCalendarEventForDate(latest, calendar, mutation.namedDeleteDate)) {
+        await this.rejectMutation(message, mutation, "That event no longer falls on the requested date, so no change was made.");
+        return;
+      }
+      if (mutation.namedDeleteFutureOnly && !isNamedDeleteCalendarEventFuture(latest, calendar, this.now())) {
+        await this.rejectMutation(message, mutation, "That event is no longer in the future, so no change was made.");
         return;
       }
 
@@ -1220,14 +1322,35 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
         return;
       }
 
-      const refreshedMutation: PendingMutation = sameWarnings(mutation.warnings, freshDecision.warnings)
-        ? mutation
-        : { ...mutation, warnings: freshDecision.warnings };
+      const exactPrivateNamedDeleteIntent = executionIntent === "exactPrivateNamedDelete" &&
+        mutation.namedDelete === true &&
+        mutation.operation === "delete" &&
+        mutation.recurrenceScope === undefined;
+      const canExecuteExactPrivateNamedDelete = exactPrivateNamedDeleteIntent &&
+        !isRecurringEvent(latest) &&
+        !hasExternalGuests(latest);
+      const becameSharedExactPrivateNamedDelete = exactPrivateNamedDeleteIntent &&
+        !isRecurringEvent(latest) &&
+        hasExternalGuests(latest);
+      const refreshedMutation: PendingMutation =
+        sameWarnings(mutation.warnings, freshDecision.warnings) && !becameSharedExactPrivateNamedDelete
+          ? mutation
+          : {
+            ...mutation,
+            ...(becameSharedExactPrivateNamedDelete ? { sendUpdates: "all" as const } : {}),
+            warnings: freshDecision.warnings,
+          };
       if (confirmationAccepted && !sameWarnings(mutation.warnings, freshDecision.warnings)) {
         await this.queueConfirmation(message, refreshedMutation, freshDecision);
         return;
       }
-      if (freshDecision.disposition === "require_confirmation" && !confirmationAccepted) {
+      if (becameSharedExactPrivateNamedDelete && !confirmationAccepted) {
+        await this.queueConfirmation(message, refreshedMutation, freshDecision);
+        return;
+      }
+      if (freshDecision.disposition === "require_confirmation" &&
+        !confirmationAccepted &&
+        !canExecuteExactPrivateNamedDelete) {
         await this.rejectMutation(message, refreshedMutation, "This action requires confirmation before it can be applied.");
         return;
       }
@@ -1237,8 +1360,9 @@ export class CalendarAssistant implements CalendarMessageHandler, PendingActionM
         return;
       }
 
-      const sendUpdates: CalendarSendUpdates =
-        refreshedMutation.sendUpdates === "all" || hasExternalGuests(safetyTarget) || refreshedMutation.operation === "manage_attendees"
+      const sendUpdates: CalendarSendUpdates = mutation.namedDelete
+        ? hasExternalGuests(safetyTarget) ? "all" : "none"
+        : refreshedMutation.sendUpdates === "all" || hasExternalGuests(safetyTarget) || refreshedMutation.operation === "manage_attendees"
           ? "all"
           : "none";
 

@@ -56,4 +56,28 @@ describe("ScheduledReminderScheduler", () => {
     expect(messages[1]).toMatch(/^Reminder:/i);
     expect(messages[2]).toMatch(/Late reminder/i);
   });
+
+  it("does not claim or deliver a cancelled reminder returned by a stale read", async () => {
+    const cancelled: ScheduledItem = { ...reminder(), revision: 2, status: "cancelled" };
+    const tryClaim = vi.fn(() => true);
+    const sendOwnerMessage = vi.fn(async () => undefined);
+    const complete = vi.fn(() => true);
+    const scheduler = new ScheduledReminderScheduler({
+      logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+      now: () => new Date("2026-08-18T13:00:00.000Z"),
+      ownerId,
+      sendOwnerMessage,
+      stateRepository: {
+        completeScheduledReminderDelivery: complete,
+        listDueScheduledReminders: () => [cancelled],
+        releaseScheduledReminderClaim: vi.fn(),
+        tryClaimScheduledReminderDelivery: tryClaim,
+      },
+    });
+
+    await expect(scheduler.runOnce()).resolves.toEqual({ delivered: 0, failed: 0, skipped: 1 });
+    expect(tryClaim).not.toHaveBeenCalled();
+    expect(sendOwnerMessage).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+  });
 });

@@ -4,8 +4,10 @@ import type {
   CalendarEvent,
   CalendarReference,
 } from "../domain/calendar.js";
+import type { ManagedCalendar } from "../domain/calendar-management.js";
 import type {
   CalendarGateway,
+  CalendarManagementGateway,
   CreateCalendarEventInput,
   DeleteCalendarEventInput,
   ListCalendarEventsInput,
@@ -47,7 +49,7 @@ export class CalendarChangeTracker {
     }
   }
 
-  public observeCalendars(calendars: readonly CalendarReference[]): void {
+  public observeCalendars(calendars: readonly (CalendarReference | ManagedCalendar)[]): void {
     const fingerprint = digest(JSON.stringify(calendars
       .map((calendar) => ({
         id: calendar.id,
@@ -55,6 +57,14 @@ export class CalendarChangeTracker {
         readOnly: calendar.readOnly,
         summary: calendar.summary,
         timeZone: calendar.timeZone,
+        ...("accessRole" in calendar ? {
+          accessRole: calendar.accessRole,
+          backgroundColor: calendar.backgroundColor,
+          description: calendar.description,
+          foregroundColor: calendar.foregroundColor,
+          hidden: calendar.hidden,
+          selected: calendar.selected,
+        } : {}),
       }))
       .sort((first, second) => first.id.localeCompare(second.id))));
     this.recordFingerprint(
@@ -151,6 +161,47 @@ export class TrackedCalendarGateway implements CalendarGateway {
   public async truncateRecurringEvent(input: TruncateRecurringEventInput): Promise<void> {
     await this.delegate.truncateRecurringEvent(input);
     this.tracker.markChanged();
+  }
+}
+
+/** Adds cache invalidation to calendar-resource and cross-calendar mutations. */
+export class TrackedCalendarManagementGateway implements CalendarManagementGateway {
+  public constructor(
+    private readonly delegate: CalendarManagementGateway,
+    private readonly tracker: CalendarChangeTracker,
+  ) { }
+
+  public async listManagedCalendars(): Promise<readonly ManagedCalendar[]> {
+    const calendars = await this.delegate.listManagedCalendars();
+    this.tracker.observeCalendars(calendars);
+    return calendars;
+  }
+
+  public async createManagedCalendar(input: Parameters<CalendarManagementGateway["createManagedCalendar"]>[0]): ReturnType<CalendarManagementGateway["createManagedCalendar"]> {
+    const calendar = await this.delegate.createManagedCalendar(input);
+    this.tracker.markChanged();
+    return calendar;
+  }
+
+  public async updateManagedCalendar(input: Parameters<CalendarManagementGateway["updateManagedCalendar"]>[0]): ReturnType<CalendarManagementGateway["updateManagedCalendar"]> {
+    const calendar = await this.delegate.updateManagedCalendar(input);
+    this.tracker.markChanged();
+    return calendar;
+  }
+
+  public async deleteManagedCalendar(calendarId: string): Promise<void> {
+    await this.delegate.deleteManagedCalendar(calendarId);
+    this.tracker.markChanged();
+  }
+
+  public async listMigrationEvents(input: Parameters<CalendarManagementGateway["listMigrationEvents"]>[0]): ReturnType<CalendarManagementGateway["listMigrationEvents"]> {
+    return this.delegate.listMigrationEvents(input);
+  }
+
+  public async moveCalendarEvent(input: Parameters<CalendarManagementGateway["moveCalendarEvent"]>[0]): ReturnType<CalendarManagementGateway["moveCalendarEvent"]> {
+    const event = await this.delegate.moveCalendarEvent(input);
+    this.tracker.markChanged();
+    return event;
   }
 }
 

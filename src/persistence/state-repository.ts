@@ -136,6 +136,39 @@ export interface AuditRecordInput {
   readonly status: "failed" | "succeeded";
 }
 
+export type CalendarMigrationJobStatus = "cancelled" | "completed" | "failed" | "pending" | "running";
+export type CalendarMigrationEventStatus = "failed" | "moved" | "pending" | "unsupported";
+
+export interface CalendarMigrationJob {
+  readonly completedAt?: Date;
+  readonly createdAt: Date;
+  readonly destinationCalendarId: string;
+  readonly destinationCalendarName: string;
+  readonly failureReason?: string;
+  readonly id: string;
+  readonly ownerId: string;
+  readonly sourceCalendarId: string;
+  readonly sourceCalendarName: string;
+  readonly status: CalendarMigrationJobStatus;
+  readonly updatedAt: Date;
+}
+
+export interface CalendarMigrationEventRecord {
+  readonly destinationEventId?: string;
+  readonly failureReason?: string;
+  readonly jobId: string;
+  readonly sourceEventId: string;
+  readonly status: CalendarMigrationEventStatus;
+  readonly updatedAt: Date;
+}
+
+export interface WebSession {
+  readonly createdAt: Date;
+  readonly csrfTokenHash: string;
+  readonly expiresAt: Date;
+  readonly ownerId: string;
+}
+
 export interface SaveNaturalLanguageContextInput extends NaturalLanguageConversationContext {
   readonly expiresAt: Date;
   readonly now: Date;
@@ -228,6 +261,10 @@ function occurrenceStartValue(key: ReminderOverrideKey): string {
 
 function hashOAuthState(state: string): string {
   return createHash("sha256").update(state, "utf8").digest("base64url");
+}
+
+function hashOpaqueValue(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("base64url");
 }
 
 function localTaskDate(value: string | null, name: string): Date | undefined {
@@ -962,6 +999,283 @@ export class AppStateRepository {
         JSON.stringify(input.details ?? {}),
         new Date().toISOString(),
       );
+  }
+
+  public createCalendarMigrationJob(input: {
+    destinationCalendarId: string;
+    destinationCalendarName: string;
+    id: string;
+    now: Date;
+    ownerId: string;
+    sourceCalendarId: string;
+    sourceCalendarName: string;
+  }): void {
+    assertNonEmpty(input.id, "migration job id");
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertNonEmpty(input.sourceCalendarId, "sourceCalendarId");
+    assertNonEmpty(input.destinationCalendarId, "destinationCalendarId");
+    assertValidDate(input.now, "now");
+    const timestamp = input.now.toISOString();
+    this.store.connection.prepare(
+      `INSERT INTO calendar_migration_jobs (
+        id, owner_id, source_calendar_id, destination_calendar_id,
+        source_calendar_name, destination_calendar_name, status,
+        failure_reason, created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, NULL)`,
+    ).run(
+      input.id,
+      input.ownerId,
+      input.sourceCalendarId,
+      input.destinationCalendarId,
+      input.sourceCalendarName,
+      input.destinationCalendarName,
+      timestamp,
+      timestamp,
+    );
+  }
+
+  public getCalendarMigrationJob(input: { id: string; ownerId: string }): CalendarMigrationJob | undefined {
+    const row = this.store.connection.prepare(
+      `SELECT id, owner_id, source_calendar_id, destination_calendar_id,
+              source_calendar_name, destination_calendar_name, status,
+              failure_reason, created_at, updated_at, completed_at
+       FROM calendar_migration_jobs WHERE id = ? AND owner_id = ?`,
+    ).get(input.id, input.ownerId) as {
+      completed_at: string | null;
+      created_at: string;
+      destination_calendar_id: string;
+      destination_calendar_name: string;
+      failure_reason: string | null;
+      id: string;
+      owner_id: string;
+      source_calendar_id: string;
+      source_calendar_name: string;
+      status: CalendarMigrationJobStatus;
+      updated_at: string;
+    } | undefined;
+    if (!row) {
+      return undefined;
+    }
+    return {
+      ...(row.completed_at ? { completedAt: new Date(row.completed_at) } : {}),
+      createdAt: new Date(row.created_at),
+      destinationCalendarId: row.destination_calendar_id,
+      destinationCalendarName: row.destination_calendar_name,
+      ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+      id: row.id,
+      ownerId: row.owner_id,
+      sourceCalendarId: row.source_calendar_id,
+      sourceCalendarName: row.source_calendar_name,
+      status: row.status,
+      updatedAt: new Date(row.updated_at),
+    };
+  }
+
+  public updateCalendarMigrationJob(input: {
+    completedAt?: Date;
+    failureReason?: string;
+    id: string;
+    now: Date;
+    ownerId: string;
+    status: CalendarMigrationJobStatus;
+  }): void {
+    assertValidDate(input.now, "now");
+    if (input.completedAt) {
+      assertValidDate(input.completedAt, "completedAt");
+    }
+    this.store.connection.prepare(
+      `UPDATE calendar_migration_jobs
+       SET status = ?, failure_reason = ?, updated_at = ?, completed_at = ?
+       WHERE id = ? AND owner_id = ?`,
+    ).run(
+      input.status,
+      input.failureReason ?? null,
+      input.now.toISOString(),
+      input.completedAt?.toISOString() ?? null,
+      input.id,
+      input.ownerId,
+    );
+  }
+
+  public upsertCalendarMigrationEvent(input: {
+    destinationEventId?: string;
+    failureReason?: string;
+    jobId: string;
+    now: Date;
+    sourceEventId: string;
+    status: CalendarMigrationEventStatus;
+  }): void {
+    assertNonEmpty(input.jobId, "jobId");
+    assertNonEmpty(input.sourceEventId, "sourceEventId");
+    assertValidDate(input.now, "now");
+    this.store.connection.prepare(
+      `INSERT INTO calendar_migration_events (
+        job_id, source_event_id, destination_event_id, status, failure_reason, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(job_id, source_event_id) DO UPDATE SET
+        destination_event_id = excluded.destination_event_id,
+        status = excluded.status,
+        failure_reason = excluded.failure_reason,
+        updated_at = excluded.updated_at`,
+    ).run(
+      input.jobId,
+      input.sourceEventId,
+      input.destinationEventId ?? null,
+      input.status,
+      input.failureReason ?? null,
+      input.now.toISOString(),
+    );
+  }
+
+  public listCalendarMigrationEvents(input: { jobId: string }): readonly CalendarMigrationEventRecord[] {
+    const rows = this.store.connection.prepare(
+      `SELECT job_id, source_event_id, destination_event_id, status, failure_reason, updated_at
+       FROM calendar_migration_events WHERE job_id = ? ORDER BY source_event_id ASC`,
+    ).all(input.jobId) as readonly {
+      destination_event_id: string | null;
+      failure_reason: string | null;
+      job_id: string;
+      source_event_id: string;
+      status: CalendarMigrationEventStatus;
+      updated_at: string;
+    }[];
+    return rows.map((row) => ({
+      ...(row.destination_event_id ? { destinationEventId: row.destination_event_id } : {}),
+      ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+      jobId: row.job_id,
+      sourceEventId: row.source_event_id,
+      status: row.status,
+      updatedAt: new Date(row.updated_at),
+    }));
+  }
+
+  public remapReminderReferences(input: {
+    destinationCalendarId: string;
+    destinationEventId: string;
+    sourceCalendarId: string;
+    sourceEventId: string;
+  }): void {
+    assertNonEmpty(input.sourceCalendarId, "sourceCalendarId");
+    assertNonEmpty(input.sourceEventId, "sourceEventId");
+    assertNonEmpty(input.destinationCalendarId, "destinationCalendarId");
+    assertNonEmpty(input.destinationEventId, "destinationEventId");
+    this.store.connection.transaction(() => {
+      const overrides = this.store.connection.prepare(
+        `SELECT occurrence_start, minutes_before FROM reminder_overrides
+         WHERE calendar_id = ? AND event_id = ?`,
+      ).all(input.sourceCalendarId, input.sourceEventId) as readonly {
+        minutes_before: number;
+        occurrence_start: string;
+      }[];
+      for (const override of overrides) {
+        this.store.connection.prepare(
+          `INSERT INTO reminder_overrides (
+            calendar_id, event_id, occurrence_start, minutes_before, updated_at
+          ) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(calendar_id, event_id, occurrence_start) DO UPDATE SET
+            minutes_before = excluded.minutes_before, updated_at = excluded.updated_at`,
+        ).run(
+          input.destinationCalendarId,
+          input.destinationEventId,
+          override.occurrence_start,
+          override.minutes_before,
+          new Date().toISOString(),
+        );
+      }
+      this.store.connection.prepare(
+        `DELETE FROM reminder_overrides WHERE calendar_id = ? AND event_id = ?`,
+      ).run(input.sourceCalendarId, input.sourceEventId);
+
+      const oldPrefix = `${input.sourceCalendarId}:${input.sourceEventId}:`;
+      const deliveries = this.store.connection.prepare(
+        `SELECT delivery_key, event_id, scheduled_for, sent_at FROM reminder_deliveries
+         WHERE event_id = ?`,
+      ).all(input.sourceEventId) as readonly {
+        delivery_key: string;
+        event_id: string;
+        scheduled_for: string;
+        sent_at: string;
+      }[];
+      for (const delivery of deliveries) {
+        if (!delivery.delivery_key.startsWith(oldPrefix)) {
+          continue;
+        }
+        const suffix = delivery.delivery_key.slice(oldPrefix.length);
+        this.store.connection.prepare(
+          `INSERT OR IGNORE INTO reminder_deliveries (delivery_key, event_id, scheduled_for, sent_at)
+           VALUES (?, ?, ?, ?)`,
+        ).run(
+          `${input.destinationCalendarId}:${input.destinationEventId}:${suffix}`,
+          input.destinationEventId,
+          delivery.scheduled_for,
+          delivery.sent_at,
+        );
+        this.store.connection.prepare("DELETE FROM reminder_deliveries WHERE delivery_key = ?")
+          .run(delivery.delivery_key);
+      }
+    })();
+  }
+
+  public createWebSession(input: {
+    createdAt: Date;
+    csrfToken: string;
+    expiresAt: Date;
+    ownerId: string;
+    token: string;
+  }): void {
+    assertNonEmpty(input.ownerId, "ownerId");
+    assertNonEmpty(input.token, "token");
+    assertNonEmpty(input.csrfToken, "csrfToken");
+    assertValidDate(input.createdAt, "createdAt");
+    assertValidDate(input.expiresAt, "expiresAt");
+    this.store.connection.prepare(
+      `INSERT INTO web_sessions (token_hash, owner_id, csrf_token_hash, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      hashOpaqueValue(input.token),
+      input.ownerId,
+      hashOpaqueValue(input.csrfToken),
+      input.expiresAt.toISOString(),
+      input.createdAt.toISOString(),
+    );
+  }
+
+  public getWebSession(input: { now: Date; token: string }): WebSession | undefined {
+    assertValidDate(input.now, "now");
+    const tokenHash = hashOpaqueValue(input.token);
+    const row = this.store.connection.prepare(
+      `SELECT owner_id, csrf_token_hash, expires_at, created_at
+       FROM web_sessions WHERE token_hash = ?`,
+    ).get(tokenHash) as {
+      created_at: string;
+      csrf_token_hash: string;
+      expires_at: string;
+      owner_id: string;
+    } | undefined;
+    if (!row) {
+      return undefined;
+    }
+    const expiresAt = new Date(row.expires_at);
+    if (Number.isNaN(expiresAt.valueOf()) || expiresAt <= input.now) {
+      this.deleteWebSession(input.token);
+      return undefined;
+    }
+    return {
+      createdAt: new Date(row.created_at),
+      csrfTokenHash: row.csrf_token_hash,
+      expiresAt,
+      ownerId: row.owner_id,
+    };
+  }
+
+  public deleteWebSession(token: string): void {
+    this.store.connection.prepare("DELETE FROM web_sessions WHERE token_hash = ?")
+      .run(hashOpaqueValue(token));
+  }
+
+  public clearExpiredWebSessions(now: Date): void {
+    assertValidDate(now, "now");
+    this.store.connection.prepare("DELETE FROM web_sessions WHERE expires_at <= ?").run(now.toISOString());
   }
 
   private transitionLocalTask(

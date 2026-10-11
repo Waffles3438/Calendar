@@ -283,27 +283,59 @@ describe("ScheduleAssistant integration", () => {
 
 
 describe("ScheduleAssistant regression coverage", () => {
-  it("retains a relative hour as a timed reminder instead of an all-day task", async () => {
+  it("retains relative hour and minute schedules as timed reminders with rounded instants", async () => {
     const schedules = new SchedulingRepository({ databasePath: ":memory:", encryptionSecret: "x".repeat(48) });
     const instance = assistant({ schedules });
-    const request = message("Schedule focus in 1 hr");
+    const hourRequest = message("Schedule focus in 1 hr");
+    const minuteRequest = message("Schedule stretch in 30 mins");
 
-    await instance.handle(request);
+    await instance.handle(hourRequest);
+    await instance.handle(minuteRequest);
 
     const records = schedules.listActiveScheduledItems({
       ownerId,
       scheduledDateEarliest: "2026-08-18",
       scheduledDateLatest: "2026-08-18",
     });
-    expect(records).toHaveLength(1);
-    expect(records[0]).toMatchObject({
+    expect(records).toHaveLength(2);
+    expect(records.find((item) => item.title === "focus")).toMatchObject({
       dueAt: new Date("2026-08-18T13:00:00.000Z"),
       kind: "reminder",
       scheduledDate: "2026-08-18",
       title: "focus",
     });
-    expect(request.replies.join(" ")).toMatch(/Created reminder/i);
-    expect(request.replies.join(" ")).toMatch(/<t:\d+:F>/u);
+    expect(records.find((item) => item.title === "stretch")).toMatchObject({
+      dueAt: new Date("2026-08-18T12:30:00.000Z"),
+      kind: "reminder",
+      scheduledDate: "2026-08-18",
+      title: "stretch",
+    });
+    expect(hourRequest.replies.join(" ")).toMatch(/Created reminder/i);
+    expect(minuteRequest.replies.join(" ")).toMatch(/<t:\d+:F>/u);
+    schedules.close();
+  });
+
+  it("keeps an unsupported untyped delete out of scheduled cleanup", async () => {
+    const schedules = new SchedulingRepository({ databasePath: ":memory:", encryptionSecret: "x".repeat(48) });
+    schedules.createScheduledItem({
+      dueAt: new Date("2026-08-19T13:00:00.000Z"),
+      id: "unsupported-delete-reminder",
+      kind: "reminder",
+      now,
+      ownerId,
+      scheduledDate: "2026-08-19",
+      timeZone,
+      title: "play among us",
+    });
+    const planner = { calls: 0, plan: async () => { planner.calls += 1; return undefined; } };
+    const instance = assistant({ planner, schedules });
+    const request = message("delete play among us");
+
+    await expect(instance.handle(request)).resolves.toBe(true);
+
+    expect(planner.calls).toBe(1);
+    expect(request.replies).toEqual([expect.stringMatching(/could not safely interpret/i)]);
+    expect(schedules.getScheduledItem({ id: "unsupported-delete-reminder", ownerId })).toMatchObject({ status: "active" });
     schedules.close();
   });
 
@@ -1241,4 +1273,174 @@ describe("ScheduleAssistant regression coverage", () => {
     expect(state.legacy.get("bulk-legacy-1000")?.status).toBe("active");
     schedules.close();
   });
+});
+
+
+describe("ScheduleAssistant named-delete routing integration", () => {
+  it.each([
+    {
+      id: "integration-play-reminder",
+      label: "the concrete lowercase selector",
+      message: "delete play among us",
+      selectorTitle: "play among us",
+    },
+    {
+      id: "integration-play-reminder-punctuation",
+      label: "punctuation and generic-word normalization",
+      message: "delete the PLAY, among us",
+      selectorTitle: "the PLAY, among us",
+    },
+    {
+      id: "integration-play-reminder-case",
+      label: "case normalization",
+      message: "delete PLAY AMONG US!",
+      selectorTitle: "PLAY AMONG US!",
+    },
+  ])("resolves the reminder represented by 'can you remind me in 30 min to play among us' for $label", async ({ id, message: requestText, selectorTitle }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const schedules = new SchedulingRepository({ databasePath: ":memory:", encryptionSecret: "z".repeat(48) });
+    const state = new FakeState();
+    const gateway = new FakeGateway();
+    const listActiveScheduledItems = vi.spyOn(schedules, "listActiveScheduledItems");
+    const createPendingAction = vi.spyOn(state, "createPendingAction");
+    const listCalendars = vi.spyOn(gateway, "listCalendars");
+    const reminder = schedules.createScheduledItem({
+      // This is the active repository state represented by:
+      // "can you remind me in 30 min to play among us".
+      dueAt: new Date("2026-08-18T12:30:00.000Z"),
+      id,
+      kind: "reminder",
+      now,
+      ownerId,
+      scheduledDate: "2026-08-18",
+      timeZone,
+      title: "play among us",
+    });
+    const unrelatedReminder = schedules.createScheduledItem({
+      dueAt: new Date("2026-08-18T12:35:00.000Z"),
+      id: `${id}-unrelated`,
+      kind: "reminder",
+      now,
+      ownerId,
+      scheduledDate: "2026-08-18",
+      timeZone,
+      title: "play outside",
+    });
+    const foreignReminder = schedules.createScheduledItem({
+      dueAt: new Date("2026-08-18T12:40:00.000Z"),
+      id: `${id}-foreign`,
+      kind: "reminder",
+      now,
+      ownerId: "987654321098765432",
+      scheduledDate: "2026-08-18",
+      timeZone,
+      title: "play among us",
+    });
+    const legacyTask: LocalTask = {
+      createdAt: now,
+      dueAt: new Date("2026-08-18T12:45:00.000Z"),
+      id: `${id}-legacy`,
+      ownerId,
+      revision: 1,
+      status: "active",
+      timeZone,
+      title: "play among us",
+      updatedAt: now,
+    };
+    state.legacy.set(legacyTask.id, legacyTask);
+    const action = {
+      action: "delete_task" as const,
+      scope: "single" as const,
+      selector: { title: selectorTitle },
+    };
+    const localTaskAssistant = {
+      canHandlePendingAction: () => false,
+      handle: vi.fn(async () => undefined),
+      handleNaturalLanguage: vi.fn(async () => undefined),
+      handleNaturalLanguageAction: vi.fn(async () => undefined),
+      handlePendingAction: vi.fn(async () => false),
+      isTaskInput: vi.fn(() => false),
+    };
+    const planner = { plan: vi.fn(async () => action) };
+    const scheduleAssistant = assistant({ gateway, schedules, state });
+    const router = new OwnerCommandRouter({
+      localTaskAssistant,
+      naturalLanguagePlanner: planner,
+      ownerId,
+      scheduleAssistant,
+      stateRepository: state,
+      taskTimeZone: timeZone,
+    });
+
+    try {
+      const request = message(requestText);
+      await router.handle(request);
+
+      expect(planner.plan).toHaveBeenCalledTimes(1);
+      expect(listActiveScheduledItems).toHaveBeenCalledWith(expect.objectContaining({
+        kinds: ["reminder"],
+        ownerId,
+        scheduledDateEarliest: "2026-08-18",
+      }));
+      expect(localTaskAssistant.handleNaturalLanguageAction).not.toHaveBeenCalled();
+      expect(request.replies.join(" ")).toMatch(/Review matches[\s\S]*play among us/iu);
+      expect(request.replies.join(" ")).toMatch(/requires confirmation|Reply confirm/iu);
+      expect(createPendingAction).toHaveBeenCalledTimes(1);
+
+      const pendingRequest = createPendingAction.mock.calls[0]?.[0];
+      expect(pendingRequest?.ownerId).toBe(ownerId);
+      expect(pendingRequest?.payload).toMatchObject({
+        calendarEvents: [],
+        cleanupScope: "unscoped_future",
+        items: [{ expectedRevision: reminder.revision, id: reminder.id }],
+        kind: "schedule_cleanup",
+        legacyItems: [],
+        responseSource: "gemini",
+        series: [],
+      });
+      expect((pendingRequest?.payload as { items: readonly unknown[] }).items).toEqual([
+        { expectedRevision: reminder.revision, id: reminder.id },
+      ]);
+      expect(listCalendars).not.toHaveBeenCalled();
+      expect(gateway.deleteCalls).toEqual([]);
+      expect(reminder.dueAt).toEqual(new Date("2026-08-18T12:30:00.000Z"));
+      expect(schedules.getScheduledItem({ id: reminder.id, ownerId })).toMatchObject({
+        revision: 1,
+        status: "active",
+        title: "play among us",
+      });
+      expect(schedules.getScheduledItem({ id: unrelatedReminder.id, ownerId })).toMatchObject({ status: "active" });
+      expect(schedules.getScheduledItem({ id: foreignReminder.id, ownerId: foreignReminder.ownerId })).toMatchObject({ status: "active" });
+      expect(state.getLocalTask({ id: legacyTask.id, ownerId })).toMatchObject({ revision: 1, status: "active" });
+
+      const confirmation = confirmationId(request.replies.join(" "));
+      await router.handle(message(`confirm ${confirmation}`));
+
+      expect(schedules.getScheduledItem({ id: reminder.id, ownerId })).toMatchObject({ status: "cancelled", revision: 2 });
+      expect(schedules.getScheduledItem({ id: unrelatedReminder.id, ownerId })).toMatchObject({ status: "active", revision: 1 });
+      expect(schedules.getScheduledItem({ id: foreignReminder.id, ownerId: foreignReminder.ownerId })).toMatchObject({ status: "active", revision: 1 });
+      expect(state.getLocalTask({ id: legacyTask.id, ownerId })).toMatchObject({ revision: 1, status: "active" });
+      expect(gateway.deleteCalls).toEqual([]);
+    } finally {
+      listActiveScheduledItems.mockRestore();
+      createPendingAction.mockRestore();
+      listCalendars.mockRestore();
+      schedules.close();
+      vi.useRealTimers();
+    }
+  });
+
+  /*
+   * Recorded unfixed counterexample (before schedule-first routing):
+   * owner 123456789012345678, clock 2026-08-18T12:00:00.000Z,
+   * America/Toronto, reminder integration-play-reminder titled "play among us"
+   * (active, due 2026-08-18T12:30:00.000Z), and validated action
+   * { action: "delete_task", scope: "single", selector: { title: "play among us" } }
+   * sent through OwnerCommandRouter. LocalTaskAssistant-only routing returned
+   * "I could not find an active local task matching that description.", left the
+   * scheduled item active, created no schedule_cleanup pending action, and made
+   * no Calendar operation. The parameterized regression above is the fixed
+   * version of that same case and its punctuation/case variants.
+   */
 });

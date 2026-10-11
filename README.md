@@ -7,7 +7,7 @@ A single-owner Discord DM bot for private local tasks and optional Google Calend
 - **One person, direct messages only.** The bot ignores guild messages, bot messages, and DMs from everyone except `DISCORD_OWNER_ID`.
 - **Local tasks work without Google.** Configure Discord, the owner ID, and `ENCRYPTION_KEY` to use tasks even if Google is unconfigured, disconnected, or unavailable.
 - **Safe writes.** Ambiguous task matches, guest-impacting Calendar changes, Calendar deletes/reminders/recurrence/attendee changes, bulk task cancellation, and model proposals outside the phase-one low-risk set require a one-time `confirm <id>` reply. `cancel <id>` stops a pending action.
-- **Least-privilege Google access.** When enabled, the app requests `calendar.events` plus read-only calendar-list access; it does not use a service account.
+- **Calendar management uses the real Google account.** When enabled, the app requests `calendar.events`, `calendar.calendars`, and `calendar.calendarlist`; these write-capable scopes are required for event migration, calendar creation/deletion, metadata, and visibility settings. It does not use a service account.
 - **Optional hosted AI.** Gemini is used only when both Gemini variables are configured and `GEMINI_NATURAL_LANGUAGE_ENABLED` is not `false`. When a reply uses an accepted Gemini action or clarification, it ends with ` [Gemini]` by default; set `GEMINI_RESPONSE_LABEL_ENABLED=false` to hide that disclosure without disabling Gemini. Deterministic task/calendar parsing and reminders work without it.
 
 ## Local tasks
@@ -49,6 +49,7 @@ For a new scheduled reminder, the first delivery is 30 minutes before its start,
 - Node.js **22.15.0 through 22.x** and npm 11.11.0 (see `package.json`).
 - A Discord application with a bot token, the owner’s Discord user ID, and an encryption key.
 - Optional: a Google Cloud OAuth client for Google Calendar access, with a public HTTPS callback URL.
+- Optional: an authenticated browser management panel, enabled only alongside the complete Discord + Google runtime.
 - Optional: a Gemini API key and supported model identifier for unsupported task/calendar wording.
 - For production: one Linux host with systemd, persistent writable storage for SQLite, and a TLS reverse proxy when Google OAuth is enabled. The service itself is plain HTTP only.
 
@@ -107,12 +108,14 @@ Empty values are treated as unset. The bot starts in health-only mode when no lo
 | `GOOGLE_CLIENT_ID` | — | Optional Google OAuth web-client ID. |
 | `GOOGLE_CLIENT_SECRET` | — | Optional Google OAuth web-client secret. |
 | `GOOGLE_REDIRECT_URI` | — | Optional exact public callback URL, normally `https://calendar.example.com/oauth/google/callback`. |
+| `WEB_UI_TOKEN` | — | Optional browser login secret of at least 32 characters. The web panel requires the complete Discord/local and Google configurations. |
+| `WEB_OWNER_ID` | — | Optional explicit web owner ID; when supplied it must exactly match `DISCORD_OWNER_ID`. The runtime has one canonical owner. |
 | `GEMINI_API_KEY` | — | Optional Gemini API key; requires `GEMINI_MODEL`. |
 | `GEMINI_MODEL` | — | Optional Gemini model identifier; requires `GEMINI_API_KEY`. |
 | `GEMINI_NATURAL_LANGUAGE_ENABLED` | `true` | Rollout kill switch for the hosted natural-language action planner. Set `false` to leave Gemini configured but unused. |
 | `GEMINI_RESPONSE_LABEL_ENABLED` | `true` | Append ` [Gemini]` to replies that use an accepted Gemini action or clarification. Set `false` to hide the disclosure without disabling Gemini. |
 
-A local-task-only installation needs the three local values. Google Calendar features start only when all Google values are present; `/status` reports Google as unconfigured otherwise, and `/connect` / `/disconnect` explain that availability. The local task timezone must be a valid IANA timezone. `America/Toronto` observes DST, so date parsing and display follow Toronto’s current offset.
+A local-task-only installation needs the three local values. Google Calendar features start only when all Google values are present; `/status` reports Google as unconfigured otherwise, and `/connect` / `/disconnect` explain that availability. `WEB_UI_TOKEN` is not a web-only mode: enabling it requires all three Discord/local values and all three Google values. `WEB_OWNER_ID` is optional and, if set, must match `DISCORD_OWNER_ID`; the Discord owner is canonical for OAuth state, calendar-management service calls, browser sessions, migrations, and audit records. The browser panel uses the same stored Google credential as Discord and is mounted only when the full runtime is configured. The local task timezone must be a valid IANA timezone. `America/Toronto` observes DST, so date parsing and display follow Toronto’s current offset.
 
 ## Discord setup
 
@@ -139,12 +142,21 @@ The app asks for these scopes:
 
 ```text
 https://www.googleapis.com/auth/calendar.events
-https://www.googleapis.com/auth/calendar.calendarlist.readonly
+https://www.googleapis.com/auth/calendar.calendars
+https://www.googleapis.com/auth/calendar.calendarlist
 ```
 
-The OAuth URL requests offline access and explicit consent so a refresh token can be stored encrypted locally. If Google does not return a refresh token, use `/disconnect`, then `/connect` again and approve access.
+`calendar.events` permits event reads and writes, including `events.move` during safe calendar deletion. `calendar.calendars` permits calendar-resource metadata and deletion, while `calendar.calendarlist` permits colors and hidden/selected visibility settings. The OAuth URL requests offline access, incremental grants, and explicit consent so a refresh token can be stored encrypted locally. If Google does not return a refresh token, use `/disconnect`, then `/connect` again and approve access.
 
 Use the official [OAuth web-server guide](https://developers.google.com/identity/protocols/oauth2/web-server) and [Calendar authorization-scope reference](https://developers.google.com/workspace/calendar/api/auth) when configuring the Cloud project.
+
+## Authenticated web calendar panel
+
+Set `WEB_UI_TOKEN` to enable the dark authenticated `My calendars` panel. The panel is an optional second interface over the same Google account used by Discord; it is not a web-only runtime and never receives Google OAuth tokens in the browser. It requires the complete Discord/local configuration and all three Google OAuth settings. `WEB_OWNER_ID` may be left empty; if supplied, it must equal `DISCORD_OWNER_ID` because this application has one owner and one encrypted OAuth credential.
+
+Start authorization from the owner’s Discord DM with `/connect`, complete the Google consent flow, and use `/status` to verify the primary calendar. The browser panel does not initiate a separate OAuth flow: the existing `/oauth/google/callback` stores the shared credential, while the panel uses the authenticated server session and CSRF-protected management API afterward. `/disconnect` remains a Discord control and invalidates Calendar-dependent caches.
+
+The panel lists all accessible Google calendars, including hidden entries, and supports the predefined templates, metadata/color edits, visibility changes, and destination-required deletion migration. Its login token is separate from the Google credential and should be treated as a secret.
 
 ## Optional Gemini natural-language layer
 
@@ -239,6 +251,9 @@ LOCAL_TASK_TIME_ZONE=America/Toronto
 DISCORD_BOT_TOKEN=replace-me
 DISCORD_OWNER_ID=123456789012345678
 ENCRYPTION_KEY=replace-with-a-durable-random-secret
+# Optional authenticated web panel; requires the complete Google settings below.
+# WEB_UI_TOKEN=replace-with-a-random-32-character-token
+# WEB_OWNER_ID=123456789012345678
 # Optional Google Calendar integration: include all three or none.
 # GOOGLE_CLIENT_ID=replace-me.apps.googleusercontent.com
 # GOOGLE_CLIENT_SECRET=replace-me

@@ -9,6 +9,13 @@ import type {
   CalendarReference,
   CalendarSendUpdates,
 } from "../domain/calendar.js";
+import {
+  calendarCapabilities,
+  type CalendarAccessRole,
+  type CalendarListSettingsPatch,
+  type CalendarMetadataPatch,
+  type ManagedCalendar,
+} from "../domain/calendar-management.js";
 import type {
   AppStateRepository,
   GoogleOAuthCredentials,
@@ -17,6 +24,55 @@ import type { GoogleOAuthClientConfig } from "./oauth-service.js";
 
 export interface CalendarReader {
   listCalendars(): Promise<readonly CalendarReference[]>;
+}
+
+export interface CalendarMigrationEvent {
+  readonly calendarId: string;
+  readonly end?: CalendarEventDateTime;
+  readonly eventType?: string;
+  readonly etag: string;
+  readonly hasExternalGuests: boolean;
+  readonly id: string;
+  readonly locked: boolean;
+  readonly recurrence?: readonly string[];
+  readonly recurringEventId?: string;
+  readonly start?: CalendarEventDateTime;
+  readonly status: "cancelled" | "confirmed" | "tentative";
+  readonly summary: string;
+}
+
+export interface CreateManagedCalendarInput {
+  readonly backgroundColor: string;
+  readonly description: string;
+  readonly foregroundColor: string;
+  readonly name: string;
+  readonly timeZone?: string;
+}
+
+export interface UpdateManagedCalendarInput {
+  readonly calendarId: string;
+  readonly listSettings?: CalendarListSettingsPatch;
+  readonly metadata?: CalendarMetadataPatch;
+}
+
+export interface ListMigrationEventsInput {
+  readonly calendarId: string;
+}
+
+export interface MoveCalendarEventInput {
+  readonly destinationCalendarId: string;
+  readonly eventId: string;
+  readonly sendUpdates: CalendarSendUpdates;
+  readonly sourceCalendarId: string;
+}
+
+export interface CalendarManagementGateway {
+  createManagedCalendar(input: CreateManagedCalendarInput): Promise<ManagedCalendar>;
+  deleteManagedCalendar(calendarId: string): Promise<void>;
+  listManagedCalendars(): Promise<readonly ManagedCalendar[]>;
+  listMigrationEvents(input: ListMigrationEventsInput): Promise<readonly CalendarMigrationEvent[]>;
+  moveCalendarEvent(input: MoveCalendarEventInput): Promise<CalendarMigrationEvent>;
+  updateManagedCalendar(input: UpdateManagedCalendarInput): Promise<ManagedCalendar>;
 }
 
 export interface ListCalendarEventsInput {
@@ -78,8 +134,24 @@ export interface CalendarGateway extends CalendarReader {
 
 export interface GoogleCalendarListEntry {
   readonly accessRole?: string | null;
+  readonly backgroundColor?: string | null;
+  readonly description?: string | null;
+  readonly etag?: string | null;
+  readonly foregroundColor?: string | null;
+  readonly hidden?: boolean | null;
   readonly id?: string | null;
   readonly primary?: boolean | null;
+  readonly selected?: boolean | null;
+  readonly summary?: string | null;
+  readonly summaryOverride?: string | null;
+  readonly timeZone?: string | null;
+}
+
+interface GoogleCalendarResource {
+  readonly dataOwner?: string | null;
+  readonly description?: string | null;
+  readonly etag?: string | null;
+  readonly id?: string | null;
   readonly summary?: string | null;
   readonly timeZone?: string | null;
 }
@@ -100,7 +172,9 @@ interface GoogleCalendarEvent {
   readonly description?: string | null;
   readonly end?: GoogleCalendarEventDateTime | null;
   readonly etag?: string | null;
+  readonly eventType?: string | null;
   readonly id?: string | null;
+  readonly locked?: boolean | null;
   readonly originalStartTime?: GoogleCalendarEventDateTime | null;
   readonly recurrence?: readonly string[] | null;
   readonly recurringEventId?: string | null;
@@ -110,6 +184,7 @@ interface GoogleCalendarEvent {
 }
 
 export interface GoogleCalendarApiOptions extends GoogleOAuthClientConfig {
+  readonly calendarClientFactory?: (auth: InstanceType<typeof google.auth.OAuth2>) => calendar_v3.Calendar;
   readonly stateRepository: Pick<AppStateRepository, "getGoogleOAuth" | "saveGoogleOAuth">;
 }
 
@@ -146,13 +221,48 @@ export function normalizeGoogleCalendarReference(
     return undefined;
   }
 
-  const accessRole = entry.accessRole ?? "reader";
+  const capabilities = calendarCapabilities(entry.accessRole, Boolean(entry.primary));
   return {
     id: entry.id,
     isPrimary: Boolean(entry.primary),
-    readOnly: accessRole === "freeBusyReader" || accessRole === "reader",
-    summary: entry.summary ?? entry.id,
+    readOnly: capabilities.readOnly,
+    summary: entry.summaryOverride ?? entry.summary ?? entry.id,
     timeZone: entry.timeZone ?? "UTC",
+  };
+}
+
+export function normalizeGoogleManagedCalendar(
+  entry: GoogleCalendarListEntry,
+  resource?: GoogleCalendarResource,
+): ManagedCalendar | undefined {
+  if (!entry.id) {
+    return undefined;
+  }
+
+  const isPrimary = Boolean(entry.primary);
+  const capabilities = calendarCapabilities(entry.accessRole, isPrimary);
+  const summary = entry.summaryOverride ?? entry.summary ?? resource?.summary ?? entry.id;
+  const timeZone = entry.timeZone ?? resource?.timeZone ?? "UTC";
+  return {
+    accessRole: capabilities.accessRole,
+    ...(entry.backgroundColor ? { backgroundColor: entry.backgroundColor } : {}),
+    canDelete: capabilities.canDelete,
+    canManageEvents: capabilities.canManageEvents,
+    canManageMetadata: capabilities.canManageMetadata,
+    ...(resource?.dataOwner ? { dataOwner: resource.dataOwner } : {}),
+    ...(entry.description ?? resource?.description
+      ? { description: entry.description ?? resource?.description ?? "" }
+      : {}),
+    ...(entry.foregroundColor ? { foregroundColor: entry.foregroundColor } : {}),
+    hidden: Boolean(entry.hidden),
+    id: entry.id,
+    isPrimary,
+    ...(resource?.etag ?? entry.etag ? { resourceEtag: resource?.etag ?? entry.etag ?? "" } : {}),
+    selected: Boolean(entry.selected),
+    ...(entry.summaryOverride ? { summaryOverride: entry.summaryOverride } : {}),
+    summary,
+    timeZone,
+    readOnly: capabilities.readOnly,
   };
 }
 
@@ -236,6 +346,34 @@ export function normalizeGoogleCalendarEvent(
   };
 }
 
+export function normalizeGoogleMigrationEvent(
+  entry: GoogleCalendarEvent,
+  calendarId: string,
+): CalendarMigrationEvent | undefined {
+  if (!entry.id) {
+    return undefined;
+  }
+
+  const fallbackTimeZone = entry.start?.timeZone ?? entry.end?.timeZone ?? "UTC";
+  const start = normalizeDateTime(entry.start, fallbackTimeZone);
+  const end = normalizeDateTime(entry.end, fallbackTimeZone);
+  const status = entry.status === "cancelled" || entry.status === "tentative" ? entry.status : "confirmed";
+  return {
+    calendarId,
+    ...(end ? { end } : {}),
+    ...(entry.eventType ? { eventType: entry.eventType } : {}),
+    etag: entry.etag ?? "",
+    hasExternalGuests: normalizeAttendees(entry.attendees).some((attendee) => !attendee.self),
+    id: entry.id,
+    locked: Boolean(entry.locked),
+    ...(entry.recurrence?.length ? { recurrence: entry.recurrence } : {}),
+    ...(entry.recurringEventId ? { recurringEventId: entry.recurringEventId } : {}),
+    ...(start ? { start } : {}),
+    status,
+    summary: entry.summary ?? "Untitled event",
+  };
+}
+
 function toGoogleDateTime(value: CalendarEventDateTime): calendar_v3.Schema$EventDateTime {
   return value.kind === "timed"
     ? { dateTime: value.dateTime, timeZone: value.timeZone }
@@ -287,7 +425,7 @@ export async function collectGooglePages<T>(
   return values;
 }
 
-export class GoogleCalendarApi implements CalendarGateway {
+export class GoogleCalendarApi implements CalendarGateway, CalendarManagementGateway {
   public constructor(private readonly options: GoogleCalendarApiOptions) { }
 
   public async listCalendars(): Promise<readonly CalendarReference[]> {
@@ -306,6 +444,144 @@ export class GoogleCalendarApi implements CalendarGateway {
       const normalized = normalizeGoogleCalendarReference(entry);
       return normalized ? [normalized] : [];
     });
+  }
+
+  public async listManagedCalendars(): Promise<readonly ManagedCalendar[]> {
+    const calendar = this.createAuthenticatedCalendarClient();
+    const entries = await collectGooglePages<GoogleCalendarListEntry>(async (pageToken) => {
+      const response = await calendar.calendarList.list({
+        ...(pageToken ? { pageToken } : {}),
+        showDeleted: false,
+        showHidden: true,
+      });
+      return {
+        items: response.data.items as readonly GoogleCalendarListEntry[] | null | undefined,
+        nextPageToken: response.data.nextPageToken,
+      };
+    });
+
+    return (await Promise.all(entries.map(async (entry) => {
+      if (!entry.id) {
+        return undefined;
+      }
+      let resource: GoogleCalendarResource | undefined;
+      try {
+        const response = await calendar.calendars.get({ calendarId: entry.id });
+        resource = response.data as GoogleCalendarResource;
+      } catch {
+        // CalendarList metadata is still useful when a shared calendar resource
+        // cannot be read with the current grant.
+      }
+      return normalizeGoogleManagedCalendar(entry, resource);
+    }))).filter((value): value is ManagedCalendar => Boolean(value));
+  }
+
+  public async createManagedCalendar(input: CreateManagedCalendarInput): Promise<ManagedCalendar> {
+    const calendar = this.createAuthenticatedCalendarClient();
+    const response = await calendar.calendars.insert({
+      requestBody: {
+        description: input.description,
+        summary: input.name,
+        ...(input.timeZone ? { timeZone: input.timeZone } : {}),
+      },
+    });
+    const calendarId = response.data.id;
+    if (!calendarId) {
+      throw new GoogleCalendarConnectionError("Google did not return the created calendar ID");
+    }
+
+    await calendar.calendarList.patch({
+      calendarId,
+      colorRgbFormat: true,
+      requestBody: {
+        backgroundColor: input.backgroundColor,
+        foregroundColor: input.foregroundColor,
+        hidden: false,
+        selected: true,
+      },
+    });
+    return this.getManagedCalendar(calendarId);
+  }
+
+  public async updateManagedCalendar(input: UpdateManagedCalendarInput): Promise<ManagedCalendar> {
+    const calendar = this.createAuthenticatedCalendarClient();
+    if (input.metadata && Object.keys(input.metadata).length > 0) {
+      await calendar.calendars.patch({
+        calendarId: input.calendarId,
+        requestBody: {
+          ...(input.metadata.description !== undefined ? { description: input.metadata.description } : {}),
+          ...(input.metadata.name !== undefined ? { summary: input.metadata.name } : {}),
+        },
+      });
+    }
+    if (input.listSettings && Object.keys(input.listSettings).length > 0) {
+      await calendar.calendarList.patch({
+        calendarId: input.calendarId,
+        colorRgbFormat: true,
+        requestBody: {
+          ...(input.listSettings.backgroundColor ? { backgroundColor: input.listSettings.backgroundColor } : {}),
+          ...(input.listSettings.foregroundColor ? { foregroundColor: input.listSettings.foregroundColor } : {}),
+          ...(input.listSettings.hidden !== undefined ? { hidden: input.listSettings.hidden } : {}),
+          ...(input.listSettings.selected !== undefined ? { selected: input.listSettings.selected } : {}),
+        },
+      });
+    }
+    return this.getManagedCalendar(input.calendarId);
+  }
+
+  public async deleteManagedCalendar(calendarId: string): Promise<void> {
+    const calendar = this.createAuthenticatedCalendarClient();
+    await calendar.calendars.delete({ calendarId });
+  }
+
+  public async listMigrationEvents(input: ListMigrationEventsInput): Promise<readonly CalendarMigrationEvent[]> {
+    const calendar = this.createAuthenticatedCalendarClient();
+    const entries = await collectGooglePages<GoogleCalendarEvent>(async (pageToken) => {
+      const response = await calendar.events.list({
+        calendarId: input.calendarId,
+        ...(pageToken ? { pageToken } : {}),
+        maxResults: 2_500,
+        showDeleted: false,
+        singleEvents: false,
+      });
+      return {
+        items: response.data.items as readonly GoogleCalendarEvent[] | null | undefined,
+        nextPageToken: response.data.nextPageToken,
+      };
+    });
+    return entries.flatMap((entry) => {
+      const normalized = normalizeGoogleMigrationEvent(entry, input.calendarId);
+      return normalized ? [normalized] : [];
+    });
+  }
+
+  public async moveCalendarEvent(input: MoveCalendarEventInput): Promise<CalendarMigrationEvent> {
+    const calendar = this.createAuthenticatedCalendarClient();
+    const response = await calendar.events.move({
+      calendarId: input.sourceCalendarId,
+      destination: input.destinationCalendarId,
+      eventId: input.eventId,
+      sendUpdates: input.sendUpdates,
+    });
+    const normalized = normalizeGoogleMigrationEvent(response.data as GoogleCalendarEvent, input.destinationCalendarId);
+    if (!normalized) {
+      throw new GoogleCalendarConnectionError("Google did not return the moved event");
+    }
+    return normalized;
+  }
+
+  private async getManagedCalendar(calendarId: string): Promise<ManagedCalendar> {
+    const calendar = this.createAuthenticatedCalendarClient();
+    const [listResponse, resourceResponse] = await Promise.all([
+      calendar.calendarList.get({ calendarId }),
+      calendar.calendars.get({ calendarId }),
+    ]);
+    const entry = listResponse.data as GoogleCalendarListEntry;
+    const normalized = normalizeGoogleManagedCalendar(entry, resourceResponse.data as GoogleCalendarResource);
+    if (!normalized) {
+      throw new GoogleCalendarConnectionError("Google returned an invalid calendar");
+    }
+    return normalized;
   }
 
   public async listEvents(input: ListCalendarEventsInput): Promise<readonly CalendarEvent[]> {
@@ -473,7 +749,7 @@ export class GoogleCalendarApi implements CalendarGateway {
       this.persistRefreshedCredentials(credentials, tokens);
     });
 
-    return google.calendar({ auth, version: "v3" });
+    return this.options.calendarClientFactory?.(auth) ?? google.calendar({ auth, version: "v3" });
   }
 
   private persistRefreshedCredentials(
@@ -491,7 +767,9 @@ export class GoogleCalendarApi implements CalendarGateway {
 
     this.options.stateRepository.saveGoogleOAuth({
       accessToken: tokens.access_token ?? current.accessToken,
-      ...(tokens.expiry_date ? { expiresAt: new Date(tokens.expiry_date).toISOString() } : {}),
+      ...(tokens.expiry_date !== undefined && tokens.expiry_date !== null
+        ? { expiresAt: new Date(tokens.expiry_date).toISOString() }
+        : current.expiresAt ? { expiresAt: current.expiresAt } : {}),
       ...(tokens.refresh_token || current.refreshToken
         ? { refreshToken: tokens.refresh_token ?? current.refreshToken }
         : {}),
